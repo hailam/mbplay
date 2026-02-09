@@ -1,8 +1,21 @@
 add_rules("mode.debug", "mode.release")
 
+add_requires("qoi")
+
 target("mandelbrotplay_c")
     set_kind("binary")
+    set_languages("c17")
+
     add_files("src/*.c")
+    add_files("src/mandelbrot/*.c")
+    add_files("src/render/*.c")
+    add_includedirs("src")
+    add_packages("qoi")
+
+    -- Tier 1: Compiler optimization flags
+    set_optimize("fastest")
+    add_cxflags("-march=native", "-flto", {force = true})
+    add_ldflags("-flto", {force = true})
 
 --
 -- If you want to known more usage about xmake, please see https://xmake.io
