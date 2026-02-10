@@ -89,4 +89,68 @@ typedef struct {
     unsigned char r, g, b;
 } PixelColor;
 
+// =============================================================================
+// Interactive Viewer State
+// =============================================================================
+
+typedef struct {
+    double center_x, center_y;  // Complex plane center
+    double zoom_level;          // 1.0 = default view, higher = zoomed in
+    int viewport_width;
+    int viewport_height;
+} MBViewState;
+
+// =============================================================================
+// Perturbation Theory Configuration
+// =============================================================================
+
+#define MB_PERTURBATION_ENABLED 1
+#define MB_REF_ORBIT_MAX_ITER 4096
+#define MB_GLITCH_MARKER 0xFFFFFFFE
+
+// Legacy: Switch to CPU double precision above this zoom level
+// With perturbation enabled, GPU can render at any zoom level
+#define MB_FLOAT_ZOOM_LIMIT 1e15  // Effectively disabled with perturbation
+
+// Tile size for interactive rendering (256x256 pixels, ~64MB for 256 tiles)
+#define MB_INTERACTIVE_TILE_SIZE 256
+#define MB_MAX_CACHED_TILES 256
+
+static inline void mb_view_state_init(MBViewState *view, int width, int height) {
+    view->center_x = -0.5;
+    view->center_y = 0.0;
+    view->zoom_level = 1.0;
+    view->viewport_width = width;
+    view->viewport_height = height;
+}
+
+// Pixel to complex plane coordinate mapping
+static inline void mb_pixel_to_complex(
+    const MBViewState *view, int px, int py,
+    double *cx, double *cy) {
+    // Scale based on viewport height to maintain aspect ratio
+    double scale = (2.0 / view->viewport_height) / view->zoom_level;
+    *cx = view->center_x + (px - view->viewport_width / 2.0) * scale;
+    *cy = view->center_y + (py - view->viewport_height / 2.0) * scale;
+}
+
+// Complex to pixel coordinate mapping
+static inline void mb_complex_to_pixel(
+    const MBViewState *view, double cx, double cy,
+    int *px, int *py) {
+    double scale = (2.0 / view->viewport_height) / view->zoom_level;
+    *px = (int)((cx - view->center_x) / scale + view->viewport_width / 2.0);
+    *py = (int)((cy - view->center_y) / scale + view->viewport_height / 2.0);
+}
+
+// Get the current scale (complex units per pixel)
+static inline double mb_view_get_scale(const MBViewState *view) {
+    return (2.0 / view->viewport_height) / view->zoom_level;
+}
+
+// Check if we need double precision at current zoom level
+static inline int mb_view_needs_double(const MBViewState *view) {
+    return view->zoom_level >= MB_FLOAT_ZOOM_LIMIT;
+}
+
 #endif // MB_CONFIG_H

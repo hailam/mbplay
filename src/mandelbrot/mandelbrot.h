@@ -40,4 +40,28 @@ unsigned int mb_compute_iteration_scalar(double cx, double cy);
 void mb_compute_iteration_simd2(double cx0, double cy0, double cx1, double cy1,
                                 unsigned int *iter0, unsigned int *iter1);
 
+// =============================================================================
+// Tile-based Computation (for interactive viewer)
+// =============================================================================
+
+/**
+ * Compute a tile using double precision (CPU).
+ * Used for deep zoom when float precision is insufficient.
+ *
+ * @param center_x View center X in complex plane
+ * @param center_y View center Y in complex plane
+ * @param scale Complex units per pixel
+ * @param tile_x Tile X offset in pixels
+ * @param tile_y Tile Y offset in pixels
+ * @param tile_size Tile dimension
+ * @param vp_half_w Half viewport width
+ * @param vp_half_h Half viewport height
+ * @param max_iter Maximum iterations
+ * @param output Output buffer (tile_size * tile_size pixels)
+ */
+void mb_compute_tile_double(double center_x, double center_y, double scale,
+                            int tile_x, int tile_y, int tile_size,
+                            int vp_half_w, int vp_half_h,
+                            int max_iter, PixelColor *output);
+
 #endif // MB_MANDELBROT_H

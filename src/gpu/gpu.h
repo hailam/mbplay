@@ -2,7 +2,9 @@
 #define MB_GPU_H
 
 #include "../config.h"
+#include "../perturbation/perturbation.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 // =============================================================================
 // GPU Compute API (Metal via CMT)
@@ -44,5 +46,96 @@ void gpu_compute_full(PixelColor *output);
  * Clean up GPU resources.
  */
 void gpu_cleanup(void);
+
+// =============================================================================
+// Tile-based Compute API (for interactive viewer)
+// =============================================================================
+
+/**
+ * Parameters for tile-based GPU computation.
+ */
+typedef struct {
+    float center_x;     // View center X in complex plane
+    float center_y;     // View center Y in complex plane
+    float scale;        // Complex units per pixel
+    uint32_t tile_x;    // Tile X offset in pixels
+    uint32_t tile_y;    // Tile Y offset in pixels
+    uint32_t tile_size; // Tile dimension (typically 256)
+    uint32_t max_iter;  // Maximum iterations
+    uint32_t vp_half_w; // Half viewport width
+    uint32_t vp_half_h; // Half viewport height
+} GPUTileParams;
+
+/**
+ * Initialize GPU for tile-based rendering.
+ * @param tile_size Size of tiles (typically 256)
+ * @param max_iter Maximum iterations
+ * @return 0 on success, -1 on failure
+ */
+int gpu_init_tiles(int tile_size, int max_iter);
+
+/**
+ * Compute a single tile on GPU using float precision.
+ * @param params Tile parameters
+ * @param output Output buffer (tile_size * tile_size pixels)
+ */
+void gpu_compute_tile(const GPUTileParams *params, PixelColor *output);
+
+/**
+ * Check if GPU tile compute is initialized.
+ * @return true if initialized
+ */
+bool gpu_tiles_initialized(void);
+
+// =============================================================================
+// Perturbation-based Compute API (for deep zoom)
+// =============================================================================
+
+/**
+ * Parameters for perturbation-based GPU computation.
+ */
+typedef struct {
+    float center_x;     // View center X in complex plane
+    float center_y;     // View center Y in complex plane
+    float scale;        // Complex units per pixel
+    float ref_cx;       // Reference point C real
+    float ref_cy;       // Reference point C imaginary
+    uint32_t tile_x;    // Tile X offset in pixels
+    uint32_t tile_y;    // Tile Y offset in pixels
+    uint32_t tile_size; // Tile dimension (typically 256)
+    uint32_t max_iter;  // Maximum iterations
+    uint32_t ref_escape_iter;  // When reference orbit escaped
+    uint32_t vp_half_w; // Half viewport width
+    uint32_t vp_half_h; // Half viewport height
+} GPUPerturbTileParams;
+
+/**
+ * Initialize GPU for perturbation-based rendering.
+ * @param max_iter Maximum iterations (for reference orbit buffer)
+ * @return 0 on success, -1 on failure
+ */
+int gpu_init_perturbation(uint32_t max_iter);
+
+/**
+ * Upload reference orbit to GPU.
+ * @param orbit The computed reference orbit
+ */
+void gpu_update_reference_orbit(const ReferenceOrbit *orbit);
+
+/**
+ * Compute a single tile using perturbation theory.
+ * Output iterations buffer may contain 0xFFFFFFFE for glitched pixels.
+ * @param params Tile parameters including reference info
+ * @param output Output buffer (tile_size * tile_size pixels)
+ * @param iterations Optional: raw iteration output (for glitch detection)
+ */
+void gpu_compute_tile_perturb(const GPUPerturbTileParams *params,
+                              PixelColor *output, uint32_t *iterations);
+
+/**
+ * Check if perturbation compute is initialized.
+ * @return true if initialized
+ */
+bool gpu_perturbation_initialized(void);
 
 #endif // MB_GPU_H

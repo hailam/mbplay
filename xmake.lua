@@ -66,3 +66,49 @@ target("mandelbrotplay_c")
     set_optimize("fastest")
     add_cxflags("-march=native", "-flto", {force = true})
     add_ldflags("-flto", {force = true})
+
+-- Interactive viewer target (native macOS, no SDL2)
+target("mandelbrot_interactive")
+    set_kind("binary")
+    set_languages("c17", "c++17")
+
+    -- Main entry point
+    add_files("src/viewer_native/main_interactive.c")
+
+    -- Native viewer (Objective-C)
+    add_files("src/viewer_native/*.m")
+
+    -- Core compute modules
+    add_files("src/mandelbrot/*.c")
+    add_files("src/gpu/*.c")
+    add_files("src/gpu/*.m")
+    add_files("src/tile_cache/*.c")
+    add_files("src/compute/*.c")
+    add_files("src/perturbation/*.c")
+
+    -- CMT Objective-C sources (compiled from package install dir)
+    on_load(function (target)
+        local cmt = target:pkg("cmt")
+        if cmt then
+            local cmt_src = path.join(cmt:installdir(), "src")
+            target:add("files", path.join(cmt_src, "*.m"))
+            target:add("includedirs", path.join(cmt:installdir(), "include"))
+        end
+    end)
+
+    -- Disable ARC for Objective-C files (CMT library compatibility)
+    add_mxflags("-fno-objc-arc", {force = true})
+
+    -- Frameworks (macOS only)
+    if is_plat("macosx") then
+        add_frameworks("Metal", "Foundation", "QuartzCore", "AppKit", "CoreVideo")
+    end
+
+    -- Packages (no SDL2!)
+    add_packages("cmt")
+    add_includedirs("src")
+
+    -- Optimization
+    set_optimize("fastest")
+    add_cxflags("-march=native", "-flto", {force = true})
+    add_ldflags("-flto", {force = true})
