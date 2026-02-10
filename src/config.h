@@ -15,13 +15,29 @@
 #define MB_SIMD_NONE 1
 #endif
 
+// GPU detection (Metal on macOS)
+#if defined(__APPLE__) && defined(__MACH__)
+#define MB_GPU_METAL 1
+#endif
+
 // =============================================================================
-// Image Dimensions
+// Default Image Dimensions (can be overridden at runtime)
 // =============================================================================
 
-#define MB_WIDTH 19200
-#define MB_HEIGHT 10800
-#define MB_MAX_ITER 1000
+#define MB_DEFAULT_WIDTH 1920
+#define MB_DEFAULT_HEIGHT 1080
+#define MB_DEFAULT_MAX_ITER 1000
+
+// Legacy defines for backward compatibility with existing code
+#ifndef MB_WIDTH
+#define MB_WIDTH MB_DEFAULT_WIDTH
+#endif
+#ifndef MB_HEIGHT
+#define MB_HEIGHT MB_DEFAULT_HEIGHT
+#endif
+#ifndef MB_MAX_ITER
+#define MB_MAX_ITER MB_DEFAULT_MAX_ITER
+#endif
 
 // =============================================================================
 // Tile-based Rendering
@@ -33,7 +49,7 @@
 #define MB_TOTAL_TILES (MB_NUM_TILES_X * MB_NUM_TILES_Y)
 
 // =============================================================================
-// Pre-computed Scale Constants
+// Pre-computed Scale Constants (for default dimensions)
 // =============================================================================
 
 #define MB_CX_SCALE (3.5 / MB_WIDTH)
@@ -42,11 +58,35 @@
 #define MB_HEIGHT_HALF (MB_HEIGHT / 2.0)
 
 // =============================================================================
+// Runtime Configuration
+// =============================================================================
+
+typedef struct {
+    int width;
+    int height;
+    int max_iter;
+    double cx_scale;
+    double cy_scale;
+    double width_half;
+    double height_half;
+} MBConfig;
+
+static inline void mb_config_init(MBConfig *cfg, int width, int height, int max_iter) {
+    cfg->width = width;
+    cfg->height = height;
+    cfg->max_iter = max_iter;
+    cfg->cx_scale = 3.5 / width;
+    cfg->cy_scale = 2.0 / height;
+    cfg->width_half = width / 2.0;
+    cfg->height_half = height / 2.0;
+}
+
+// =============================================================================
 // Pixel Color Type
 // =============================================================================
 
 typedef struct {
-  unsigned char r, g, b;
+    unsigned char r, g, b;
 } PixelColor;
 
 #endif // MB_CONFIG_H
