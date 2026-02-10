@@ -3,6 +3,8 @@
 
 #include "../config.h"
 #include "../tile_cache/tile_cache.h"
+#include "../tile_cache/disk_cache.h"
+#include "../tile_map/tile_map.h"
 #include "../perturbation/perturbation.h"
 #include <stdbool.h>
 
@@ -12,6 +14,7 @@
 
 typedef struct {
     TileCache cache;
+    DiskCache *disk_cache;   // Persistent storage for map tiles
     int tile_size;
     int max_iter;
     bool gpu_available;
@@ -22,6 +25,10 @@ typedef struct {
     bool perturbation_enabled;
     double last_ref_cx, last_ref_cy;
     double last_scale;
+
+    // Reusable buffers (avoid malloc per tile)
+    float *delta_buffer;     // Pre-computed deltas for V2 API
+    uint32_t *iter_buffer;   // Iteration output for glitch detection
 } ComputeScheduler;
 
 /**
@@ -79,5 +86,31 @@ bool scheduler_using_double(const ComputeScheduler *sched);
  * @param sched The scheduler
  */
 void scheduler_cleanup(ComputeScheduler *sched);
+
+// =============================================================================
+// Map Tile API (z/x/y coordinates like web maps)
+// =============================================================================
+
+/**
+ * Initialize disk cache for persistent map tile storage.
+ * Call this before using scheduler_get_map_tile.
+ * @param sched The scheduler
+ * @param cache_path Base path for tile cache (e.g., ~/.mandelbrot/tiles)
+ * @param max_size_bytes Maximum cache size (0 for default 1GB)
+ * @return 0 on success, -1 on failure
+ */
+int scheduler_init_disk_cache(ComputeScheduler *sched, const char *cache_path,
+                              int64_t max_size_bytes);
+
+/**
+ * Get or compute a map tile using z/x/y coordinates.
+ * Checks disk cache first, then computes if needed.
+ * @param sched The scheduler
+ * @param tile Map tile identifier (z/x/y)
+ * @param output Output buffer (MB_TILE_SIZE * MB_TILE_SIZE pixels)
+ * @return true on success, false on error
+ */
+bool scheduler_get_map_tile(ComputeScheduler *sched, const MapTile *tile,
+                            PixelColor *output);
 
 #endif // MB_COMPUTE_SCHEDULER_H

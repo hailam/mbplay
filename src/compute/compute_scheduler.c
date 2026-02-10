@@ -2,6 +2,8 @@
 #include "../gpu/gpu.h"
 #include "../mandelbrot/mandelbrot.h"
 #include "../color/color.h"
+#include "../tile_map/tile_map.h"
+#include "../tile_cache/disk_cache.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -26,6 +28,15 @@ int scheduler_init(ComputeScheduler *sched, int tile_size, int max_iter) {
 
     // Initialize tile cache
     if (tile_cache_init(&sched->cache) != 0) {
+        return -1;
+    }
+
+    // Allocate reusable buffers
+    size_t tilePixels = (size_t)tile_size * tile_size;
+    sched->delta_buffer = (float *)malloc(tilePixels * 2 * sizeof(float));
+    sched->iter_buffer = (uint32_t *)malloc(tilePixels * sizeof(uint32_t));
+    if (!sched->delta_buffer || !sched->iter_buffer) {
+        scheduler_cleanup(sched);
         return -1;
     }
 
@@ -54,10 +65,12 @@ void scheduler_update_view(ComputeScheduler *sched, const MBViewState *view) {
                             fabs(view->center_y - sched->last_ref_cy);
         double scale_ratio = sched->last_scale > 0 ? scale / sched->last_scale : 0;
 
-        // Recompute if center moved more than 10% of viewport, or scale changed >10%
+        // Recompute if center moved more than 50% of viewport, or scale changed >50%
+        // Relaxed threshold - V2 API handles precision correctly so we don't need
+        // to recompute reference as often
         bool need_recompute = !sched->ref_orbit.valid ||
-                             center_dist > scale * view->viewport_width * 0.1 ||
-                             scale_ratio < 0.9 || scale_ratio > 1.1;
+                             center_dist > scale * view->viewport_width * 0.5 ||
+                             scale_ratio < 0.5 || scale_ratio > 2.0;
 
         if (need_recompute) {
             // Compute reference at view center
@@ -68,8 +81,9 @@ void scheduler_update_view(ComputeScheduler *sched, const MBViewState *view) {
             sched->last_ref_cy = view->center_y;
             sched->last_scale = scale;
 
-            // Invalidate cache when reference changes
-            tile_cache_new_generation(&sched->cache);
+            // NOTE: No cache invalidation on reference change.
+            // With V2 API, deltas are computed per-tile with the current
+            // reference, so cached tiles remain valid.
         }
     }
 
@@ -148,49 +162,26 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
     int px = tile_x * sched->tile_size;
     int py = tile_y * sched->tile_size;
 
-    // Use perturbation if enabled and reference is valid
+    // Use perturbation V2 if enabled and reference is valid
     if (sched->perturbation_enabled && sched->ref_orbit.valid) {
-        // Allocate iteration buffer for glitch detection
-        size_t tilePixels = (size_t)sched->tile_size * sched->tile_size;
-        uint32_t *iterations = (uint32_t *)malloc(tilePixels * sizeof(uint32_t));
+        // Pre-compute deltas on CPU (double precision)
+        gpu_precompute_deltas(view->center_x, view->center_y, scale,
+                              sched->ref_orbit.ref_cx, sched->ref_orbit.ref_cy,
+                              (uint32_t)sched->tile_size, vp_half_w, vp_half_h,
+                              (uint32_t)px, (uint32_t)py, sched->delta_buffer);
 
-        if (iterations) {
-            GPUPerturbTileParams params = {
-                .center_x = (float)view->center_x,
-                .center_y = (float)view->center_y,
-                .scale = (float)scale,
-                .ref_cx = (float)sched->ref_orbit.ref_cx,
-                .ref_cy = (float)sched->ref_orbit.ref_cy,
-                .tile_x = (uint32_t)px,
-                .tile_y = (uint32_t)py,
-                .tile_size = (uint32_t)sched->tile_size,
-                .max_iter = (uint32_t)sched->max_iter,
-                .ref_escape_iter = sched->ref_orbit.escape_iter,
-                .vp_half_w = (uint32_t)vp_half_w,
-                .vp_half_h = (uint32_t)vp_half_h
-            };
+        // Compute with pre-computed deltas (V2 API)
+        GPUPerturbParamsV2 params = {
+            .tile_size = (uint32_t)sched->tile_size,
+            .max_iter = (uint32_t)sched->max_iter,
+            .ref_escape_iter = sched->ref_orbit.escape_iter
+        };
 
-            gpu_compute_tile_perturb(&params, output, iterations);
+        gpu_compute_tile_perturb_v2(&params, sched->delta_buffer,
+                                    output, sched->iter_buffer);
 
-            // Handle glitched pixels with CPU fallback
-            handle_glitches(sched, view, iterations, px, py, output);
-
-            free(iterations);
-        } else {
-            // Fallback to standard GPU if malloc fails
-            GPUTileParams params = {
-                .center_x = (float)view->center_x,
-                .center_y = (float)view->center_y,
-                .scale = (float)scale,
-                .tile_x = (uint32_t)px,
-                .tile_y = (uint32_t)py,
-                .tile_size = (uint32_t)sched->tile_size,
-                .max_iter = (uint32_t)sched->max_iter,
-                .vp_half_w = (uint32_t)vp_half_w,
-                .vp_half_h = (uint32_t)vp_half_h
-            };
-            gpu_compute_tile(&params, output);
-        }
+        // Handle glitched pixels with CPU fallback
+        handle_glitches(sched, view, sched->iter_buffer, px, py, output);
     } else if (!sched->gpu_available) {
         // Use CPU double precision
         mb_compute_tile_double(
@@ -247,5 +238,72 @@ void scheduler_cleanup(ComputeScheduler *sched) {
     if (sched->gpu_available) {
         gpu_cleanup();
     }
+    if (sched->delta_buffer) {
+        free(sched->delta_buffer);
+        sched->delta_buffer = NULL;
+    }
+    if (sched->iter_buffer) {
+        free(sched->iter_buffer);
+        sched->iter_buffer = NULL;
+    }
+    if (sched->disk_cache) {
+        disk_cache_cleanup(sched->disk_cache);
+        sched->disk_cache = NULL;
+    }
     memset(sched, 0, sizeof(ComputeScheduler));
+}
+
+// =============================================================================
+// Map Tile API Implementation
+// =============================================================================
+
+int scheduler_init_disk_cache(ComputeScheduler *sched, const char *cache_path,
+                              int64_t max_size_bytes) {
+    if (!sched || !cache_path) return -1;
+
+    sched->disk_cache = disk_cache_init(cache_path, max_size_bytes);
+    return sched->disk_cache ? 0 : -1;
+}
+
+bool scheduler_get_map_tile(ComputeScheduler *sched, const MapTile *tile,
+                            PixelColor *output) {
+    if (!sched || !tile || !output) return false;
+
+    // 1. Check disk cache first (if zoom <= 20)
+    if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && sched->disk_cache) {
+        if (disk_cache_get(sched->disk_cache, tile, output) == 0) {
+            return true;  // Cache hit!
+        }
+    }
+
+    // 2. Compute tile bounds
+    double min_cx, max_cx, min_cy, max_cy;
+    mb_tile_to_bounds(tile, &min_cx, &max_cx, &min_cy, &max_cy);
+
+    // 3. Create view state for this tile
+    MBViewState tile_view;
+    tile_view.center_x = (min_cx + max_cx) / 2.0;
+    tile_view.center_y = (min_cy + max_cy) / 2.0;
+    tile_view.viewport_width = MB_MAP_TILE_SIZE;
+    tile_view.viewport_height = MB_MAP_TILE_SIZE;
+
+    // Zoom level = 1 / scale (units per pixel)
+    // scale = tile_width / tile_pixels
+    double tile_width = max_cx - min_cx;
+    double scale = tile_width / MB_MAP_TILE_SIZE;
+    tile_view.zoom_level = (2.0 / tile_view.viewport_height) / scale;
+
+    // 4. Update reference if needed
+    scheduler_update_view(sched, &tile_view);
+
+    // 5. Compute tile using existing infrastructure
+    // The tile is at position (0,0) in tile coordinates for this view
+    scheduler_get_tile(sched, &tile_view, 0, 0, output);
+
+    // 6. Save to disk cache
+    if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && sched->disk_cache) {
+        disk_cache_put(sched->disk_cache, tile, output);
+    }
+
+    return true;
 }

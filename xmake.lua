@@ -83,6 +83,7 @@ target("mandelbrot_interactive")
     add_files("src/gpu/*.c")
     add_files("src/gpu/*.m")
     add_files("src/tile_cache/*.c")
+    add_files("src/tile_map/*.c")
     add_files("src/compute/*.c")
     add_files("src/perturbation/*.c")
 
@@ -105,7 +106,7 @@ target("mandelbrot_interactive")
     end
 
     -- Packages (no SDL2!)
-    add_packages("cmt")
+    add_packages("cmt", "qoi")
     add_includedirs("src")
 
     -- Optimization

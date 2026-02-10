@@ -138,4 +138,50 @@ void gpu_compute_tile_perturb(const GPUPerturbTileParams *params,
  */
 bool gpu_perturbation_initialized(void);
 
+// =============================================================================
+// Perturbation V2 API (Pre-computed deltas for precision fix)
+// =============================================================================
+
+/**
+ * Parameters for perturbation V2 computation (deltas pre-computed on CPU).
+ */
+typedef struct {
+    uint32_t tile_size;      // Tile dimension (typically 256)
+    uint32_t max_iter;       // Maximum iterations
+    uint32_t ref_escape_iter; // When reference orbit escaped
+} GPUPerturbParamsV2;
+
+/**
+ * Pre-compute deltas on CPU in double precision.
+ * This fixes precision loss by computing deltas in double, then casting to float.
+ *
+ * @param center_x View center X (double)
+ * @param center_y View center Y (double)
+ * @param scale Complex units per pixel (double)
+ * @param ref_cx Reference point C real (double)
+ * @param ref_cy Reference point C imaginary (double)
+ * @param tile_size Tile dimension
+ * @param vp_half_w Half viewport width
+ * @param vp_half_h Half viewport height
+ * @param tile_px Tile X offset in pixels
+ * @param tile_py Tile Y offset in pixels
+ * @param delta_buffer Output buffer for float2 deltas (tile_size^2 * 2 floats)
+ */
+void gpu_precompute_deltas(double center_x, double center_y, double scale,
+                           double ref_cx, double ref_cy,
+                           uint32_t tile_size, int vp_half_w, int vp_half_h,
+                           uint32_t tile_px, uint32_t tile_py,
+                           float *delta_buffer);
+
+/**
+ * Compute a tile using perturbation V2 with pre-computed deltas.
+ * @param params V2 tile parameters
+ * @param deltas Pre-computed delta buffer (from gpu_precompute_deltas)
+ * @param output Output pixel buffer
+ * @param iterations Optional: raw iteration output (for glitch detection)
+ */
+void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
+                                  const float *deltas,
+                                  PixelColor *output, uint32_t *iterations);
+
 #endif // MB_GPU_H
