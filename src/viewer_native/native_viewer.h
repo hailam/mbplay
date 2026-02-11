@@ -2,6 +2,7 @@
 #define MB_NATIVE_VIEWER_H
 
 #include "../config.h"
+#include <stdbool.h>
 
 // =============================================================================
 // Native macOS Viewer API
@@ -14,9 +15,10 @@
  * @param title Window title
  * @param width Initial viewport width
  * @param height Initial viewport height
+ * @param clear_cache If true, delete disk cache before starting
  * @return 0 on success, -1 on failure
  */
-int native_viewer_init(const char *title, int width, int height);
+int native_viewer_init(const char *title, int width, int height, bool clear_cache);
 
 /**
  * Run the native event loop.

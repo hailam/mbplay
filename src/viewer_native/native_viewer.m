@@ -3,8 +3,14 @@
 #import <QuartzCore/CAMetalLayer.h>
 #include "native_viewer.h"
 #include "../compute/compute_scheduler.h"
+#include "../tile_map/tile_map.h"
+#include "../tile_cache/disk_cache.h"
 #include "../color/color.h"
+#include "../mandelbrot/mandelbrot.h"
 #include <stdlib.h>
+#include <math.h>
+
+#define CACHE_PATH "~/.mandelbrot/tiles"
 
 // =============================================================================
 // Constants
@@ -38,6 +44,16 @@
 
     // For mouse drag panning
     NSPoint _lastDragPoint;
+
+    // Map tile buffers
+    PixelColor *_mapTileBuf;        // 256x256 tile buffer
+    PixelColor *_scaledTileBuf;     // For upscaling low-res tiles
+
+    // Async tile computation
+    dispatch_queue_t _tileQueue;
+    NSMutableSet<NSString *> *_pendingTiles;
+    NSMutableDictionary<NSString *, NSData *> *_asyncTileCache;
+    NSLock *_asyncCacheLock;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect;
@@ -84,16 +100,43 @@
         }
         NSLog(@"MandelbrotView: scheduler initialized");
 
+        // Initialize disk cache
+        NSString *cachePath = [@CACHE_PATH stringByExpandingTildeInPath];
+        if (scheduler_init_disk_cache(&_scheduler, [cachePath UTF8String], 0) != 0) {
+            NSLog(@"Warning: Failed to initialize disk cache, tiles won't persist");
+        } else {
+            NSLog(@"MandelbrotView: disk cache initialized at %@", cachePath);
+        }
+
+        // Allocate map tile buffers (256x256)
+        _mapTileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
+        _scaledTileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
+        if (!_mapTileBuf || !_scaledTileBuf) {
+            NSLog(@"Failed to allocate map tile buffers");
+            if (_mapTileBuf) free(_mapTileBuf);
+            if (_scaledTileBuf) free(_scaledTileBuf);
+            scheduler_cleanup(&_scheduler);
+            return nil;
+        }
+
         // Allocate framebuffer
         size_t pixels = (size_t)_viewState.viewport_width * _viewState.viewport_height;
         _framebuffer = malloc(pixels * sizeof(PixelColor));
         if (!_framebuffer) {
+            free(_mapTileBuf);
+            free(_scaledTileBuf);
             scheduler_cleanup(&_scheduler);
             return nil;
         }
 
         _needsRedraw = YES;
         _animating = NO;
+
+        // Initialize async tile computation
+        _tileQueue = dispatch_queue_create("com.mandelbrot.tiles", DISPATCH_QUEUE_CONCURRENT);
+        _pendingTiles = [[NSMutableSet alloc] init];
+        _asyncTileCache = [[NSMutableDictionary alloc] init];
+        _asyncCacheLock = [[NSLock alloc] init];
 
         // Set up display timer for 60fps (simpler than CVDisplayLink, avoids threading issues)
         _displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60.0
@@ -117,6 +160,12 @@
     if (_framebuffer) {
         free(_framebuffer);
     }
+    if (_mapTileBuf) {
+        free(_mapTileBuf);
+    }
+    if (_scaledTileBuf) {
+        free(_scaledTileBuf);
+    }
     scheduler_cleanup(&_scheduler);
     if (_texture) {
         [_texture release];
@@ -129,6 +178,23 @@
     if (_device) {
         [_device release];
         _device = nil;
+    }
+    // Release async tile resources
+    if (_tileQueue) {
+        dispatch_release(_tileQueue);
+        _tileQueue = nil;
+    }
+    if (_pendingTiles) {
+        [_pendingTiles release];
+        _pendingTiles = nil;
+    }
+    if (_asyncTileCache) {
+        [_asyncTileCache release];
+        _asyncTileCache = nil;
+    }
+    if (_asyncCacheLock) {
+        [_asyncCacheLock release];
+        _asyncCacheLock = nil;
     }
     [super dealloc];
 }
@@ -212,7 +278,7 @@
     // Get complex coords at mouse BEFORE zoom
     double scale = mb_view_get_scale(&_viewState);
     double mouse_cx = _viewState.center_x + (point.x - _viewState.viewport_width / 2.0) * scale;
-    double mouse_cy = _viewState.center_y + (point.y - _viewState.viewport_height / 2.0) * scale;
+    double mouse_cy = _viewState.center_y - (point.y - _viewState.viewport_height / 2.0) * scale;
 
     // Apply zoom
     _viewState.zoom_level *= delta;
@@ -224,7 +290,7 @@
     // Recalculate center so mouse point stays fixed
     double new_scale = mb_view_get_scale(&_viewState);
     _viewState.center_x = mouse_cx - (point.x - _viewState.viewport_width / 2.0) * new_scale;
-    _viewState.center_y = mouse_cy - (point.y - _viewState.viewport_height / 2.0) * new_scale;
+    _viewState.center_y = mouse_cy + (point.y - _viewState.viewport_height / 2.0) * new_scale;
 }
 
 // =============================================================================
@@ -350,6 +416,8 @@
 
 - (void)invalidateCache {
     tile_cache_new_generation(&_scheduler.cache);
+    // Clear async tile cache (view changed, old tiles no longer valid for rendering)
+    // But we keep the computed tiles since they'll be saved to disk cache
     _needsRedraw = YES;
 }
 
@@ -361,78 +429,279 @@
     }
 }
 
+- (void)blitTile:(PixelColor *)src fromSize:(int)srcSize toRect:(NSRect)dstRect {
+    // Bilinear scale from src (srcSize x srcSize) to dstRect in _framebuffer
+    int dx0 = MAX(0, (int)dstRect.origin.x);
+    int dy0 = MAX(0, (int)dstRect.origin.y);
+    int dx1 = MIN(_viewState.viewport_width, (int)(dstRect.origin.x + dstRect.size.width));
+    int dy1 = MIN(_viewState.viewport_height, (int)(dstRect.origin.y + dstRect.size.height));
+
+    if (dx1 <= dx0 || dy1 <= dy0 || dstRect.size.width <= 0 || dstRect.size.height <= 0) {
+        return;
+    }
+
+    double scaleX = (double)srcSize / dstRect.size.width;
+    double scaleY = (double)srcSize / dstRect.size.height;
+
+    for (int dy = dy0; dy < dy1; dy++) {
+        double sy = (dstRect.size.height - 1 - (dy - dstRect.origin.y)) * scaleY;
+        int syi = (int)sy;
+        if (syi >= srcSize) syi = srcSize - 1;
+        if (syi < 0) syi = 0;
+
+        for (int dx = dx0; dx < dx1; dx++) {
+            double sx = (dx - dstRect.origin.x) * scaleX;
+            int sxi = (int)sx;
+            if (sxi >= srcSize) sxi = srcSize - 1;
+            if (sxi < 0) sxi = 0;
+
+            _framebuffer[dy * _viewState.viewport_width + dx] =
+                src[syi * srcSize + sxi];
+        }
+    }
+}
+
+- (NSString *)tileKeyForTile:(const MapTile *)tile {
+    return [NSString stringWithFormat:@"%d_%llu_%llu", tile->zoom, tile->x, tile->y];
+}
+
+- (BOOL)getTileFromAsyncCache:(const MapTile *)tile output:(PixelColor *)output {
+    NSString *key = [self tileKeyForTile:tile];
+    [_asyncCacheLock lock];
+    NSData *data = _asyncTileCache[key];
+    [_asyncCacheLock unlock];
+
+    if (data && data.length == MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor)) {
+        memcpy(output, data.bytes, data.length);
+        return YES;
+    }
+    return NO;
+}
+
+- (void)queueAsyncTileComputation:(MapTile)tile {
+    NSString *key = [self tileKeyForTile:&tile];
+
+    [_asyncCacheLock lock];
+    // Check if already pending or cached
+    if ([_pendingTiles containsObject:key] || _asyncTileCache[key] != nil) {
+        [_asyncCacheLock unlock];
+        return;
+    }
+    [_pendingTiles addObject:key];
+    [_asyncCacheLock unlock];
+
+    // Queue async computation
+    dispatch_async(_tileQueue, ^{
+        // Allocate buffer for this tile
+        PixelColor *tileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
+        if (!tileBuf) {
+            [_asyncCacheLock lock];
+            [_pendingTiles removeObject:key];
+            [_asyncCacheLock unlock];
+            return;
+        }
+
+        // Compute tile (this is the expensive operation)
+        // Note: We compute directly here instead of using scheduler_get_map_tile
+        // because the scheduler is not thread-safe
+        double min_cx, max_cx, min_cy, max_cy;
+        mb_tile_to_bounds(&tile, &min_cx, &max_cx, &min_cy, &max_cy);
+
+        double scale_x = (max_cx - min_cx) / MB_MAP_TILE_SIZE;
+        double scale_y = (max_cy - min_cy) / MB_MAP_TILE_SIZE;
+
+        for (int ly = 0; ly < MB_MAP_TILE_SIZE; ly++) {
+            double cy = min_cy + (ly + 0.5) * scale_y;
+            for (int lx = 0; lx < MB_MAP_TILE_SIZE; lx++) {
+                double cx = min_cx + (lx + 0.5) * scale_x;
+
+                unsigned int iteration;
+                if (mb_is_in_cardioid_or_bulb(cx, cy)) {
+                    iteration = MAX_ITER;
+                } else {
+                    double zx = 0.0, zy = 0.0;
+                    double zx2 = 0.0, zy2 = 0.0;
+                    iteration = 0;
+
+                    while (zx2 + zy2 < 4.0 && iteration < MAX_ITER) {
+                        zy = 2.0 * zx * zy + cy;
+                        zx = zx2 - zy2 + cx;
+                        zx2 = zx * zx;
+                        zy2 = zy * zy;
+                        iteration++;
+                    }
+                }
+
+                color_from_iteration(&tileBuf[ly * MB_MAP_TILE_SIZE + lx], iteration);
+            }
+        }
+
+        // Store in async cache (with memory limit)
+        NSData *tileData = [NSData dataWithBytes:tileBuf length:MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor)];
+
+        [_asyncCacheLock lock];
+        // Limit cache to 256 tiles (~64MB) to prevent unbounded memory growth
+        if (_asyncTileCache.count >= 256) {
+            // Clear oldest entries (simple strategy: remove all when limit hit)
+            [_asyncTileCache removeAllObjects];
+        }
+        _asyncTileCache[key] = tileData;
+        [_pendingTiles removeObject:key];
+        [_asyncCacheLock unlock];
+
+        free(tileBuf);
+
+        // Trigger redraw on main thread
+        dispatch_async(dispatch_get_main_queue(), ^{
+            _needsRedraw = YES;
+        });
+    });
+}
+
+- (void)renderMapTile:(const MapTile *)tile withViewScale:(double)viewScale {
+    BOOL tileReady = NO;
+
+    // 1. Check disk cache first (fast path)
+    if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache) {
+        if (disk_cache_get(_scheduler.disk_cache, tile, _mapTileBuf) == 0) {
+            tileReady = YES;
+        }
+    }
+
+    // 2. If not in disk cache, check async memory cache
+    if (!tileReady) {
+        if ([self getTileFromAsyncCache:tile output:_mapTileBuf]) {
+            tileReady = YES;
+            // Save to disk cache for future use
+            if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache) {
+                disk_cache_put(_scheduler.disk_cache, tile, _mapTileBuf);
+            }
+        }
+    }
+
+    // 3. If still not ready, queue async computation
+    if (!tileReady) {
+        MapTile tileCopy = *tile;
+        [self queueAsyncTileComputation:tileCopy];
+        return;  // Don't render - placeholder tiles will show instead
+    }
+
+    // Get tile bounds in complex plane
+    double min_cx, max_cx, min_cy, max_cy;
+    mb_tile_to_bounds(tile, &min_cx, &max_cx, &min_cy, &max_cy);
+
+    // Convert to screen coordinates using VIEW scale (not tile scale!)
+    int vp_half_w = _viewState.viewport_width / 2;
+    int vp_half_h = _viewState.viewport_height / 2;
+
+    int screen_x0 = (int)((min_cx - _viewState.center_x) / viewScale + vp_half_w);
+    int screen_y0 = (int)((_viewState.center_y - max_cy) / viewScale + vp_half_h);  // Y inverted: max_cy → top of screen
+    int screen_x1 = (int)((max_cx - _viewState.center_x) / viewScale + vp_half_w);
+    int screen_y1 = (int)((_viewState.center_y - min_cy) / viewScale + vp_half_h);  // Y inverted: min_cy → bottom of screen
+
+    [self blitTile:_mapTileBuf
+          fromSize:MB_MAP_TILE_SIZE
+            toRect:NSMakeRect(screen_x0, screen_y0,
+                              screen_x1 - screen_x0,
+                              screen_y1 - screen_y0)];
+}
+
+- (void)renderPlaceholderTilesAtZoom:(int)zoom withViewScale:(double)viewScale {
+    double halfW = (_viewState.viewport_width / 2.0) * viewScale;
+    double halfH = (_viewState.viewport_height / 2.0) * viewScale;
+
+    MapTile topLeft = mb_complex_to_tile(_viewState.center_x - halfW,
+                                          _viewState.center_y - halfH, zoom);
+    MapTile bottomRight = mb_complex_to_tile(_viewState.center_x + halfW,
+                                              _viewState.center_y + halfH, zoom);
+
+    for (uint64_t ty = topLeft.y; ty <= bottomRight.y; ty++) {
+        for (uint64_t tx = topLeft.x; tx <= bottomRight.x; tx++) {
+            MapTile tile = { .zoom = zoom, .x = tx, .y = ty };
+            if (_scheduler.disk_cache && disk_cache_exists(_scheduler.disk_cache, &tile)) {
+                [self renderMapTile:&tile withViewScale:viewScale];
+            }
+        }
+    }
+}
+
 - (void)renderFrame {
     // Safety checks
     if (!_framebuffer || _viewState.viewport_width <= 0 || _viewState.viewport_height <= 0) {
         return;
     }
 
-    // Update scheduler with current view state
     scheduler_update_view(&_scheduler, &_viewState);
 
-    // Calculate visible tiles
-    int start_tx, start_ty, end_tx, end_ty;
-    scheduler_get_visible_tiles(&_viewState, TILE_SIZE,
-                                &start_tx, &start_ty, &end_tx, &end_ty);
+    // 1. Calculate target zoom from view scale
+    //    We want tiles at ~1:1 pixel scale (256 tile pixels ≈ 256 screen pixels)
+    double viewScale = mb_view_get_scale(&_viewState);
+    double tileWidthNeeded = viewScale * MB_MAP_TILE_SIZE;  // complex width of 256 screen pixels
+    int targetZoom = (int)round(log2(MB_REAL_WIDTH / tileWidthNeeded));
+    if (targetZoom < 0) targetZoom = 0;
+    if (targetZoom > MB_MAX_ZOOM) targetZoom = MB_MAX_ZOOM;
 
-    // Temporary buffer for a single tile
-    PixelColor *tileBuf = malloc(TILE_SIZE * TILE_SIZE * sizeof(PixelColor));
-    if (!tileBuf) {
-        NSLog(@"renderFrame: failed to allocate tile buffer");
-        return;
-    }
+    // 2. Calculate visible region in complex plane using VIEW scale
+    double halfW = (_viewState.viewport_width / 2.0) * viewScale;
+    double halfH = (_viewState.viewport_height / 2.0) * viewScale;
+    double viewMinCx = _viewState.center_x - halfW;
+    double viewMaxCx = _viewState.center_x + halfW;
+    double viewMinCy = _viewState.center_y - halfH;
+    double viewMaxCy = _viewState.center_y + halfH;
 
-    // Clear framebuffer
-    memset(_framebuffer, 0, (size_t)_viewState.viewport_width * _viewState.viewport_height * sizeof(PixelColor));
+    // 3. Find which tiles intersect this region
+    MapTile topLeft = mb_complex_to_tile(viewMinCx, viewMinCy, targetZoom);
+    MapTile bottomRight = mb_complex_to_tile(viewMaxCx, viewMaxCy, targetZoom);
 
-    // Render visible tiles
-    for (int ty = start_ty; ty < end_ty; ty++) {
-        for (int tx = start_tx; tx < end_tx; tx++) {
-            // Get or compute tile
-            if (scheduler_get_tile(&_scheduler, &_viewState, tx, ty, tileBuf)) {
-                // Copy tile to framebuffer
-                int px = tx * TILE_SIZE;
-                int py = ty * TILE_SIZE;
+    // Expand by 1 tile for smooth scrolling
+    int64_t startX = (int64_t)topLeft.x - 1;
+    int64_t startY = (int64_t)topLeft.y - 1;
+    int64_t endX = (int64_t)bottomRight.x + 2;
+    int64_t endY = (int64_t)bottomRight.y + 2;
+    if (startX < 0) startX = 0;
+    if (startY < 0) startY = 0;
+    int64_t maxTile = (int64_t)1 << targetZoom;
+    if (endX > maxTile) endX = maxTile;
+    if (endY > maxTile) endY = maxTile;
 
-                for (int ly = 0; ly < TILE_SIZE; ly++) {
-                    int fy = py + ly;
-                    if (fy < 0 || fy >= _viewState.viewport_height) continue;
+    // 4. Clear framebuffer
+    size_t pixels = (size_t)_viewState.viewport_width * _viewState.viewport_height;
+    memset(_framebuffer, 0, pixels * sizeof(PixelColor));
 
-                    for (int lx = 0; lx < TILE_SIZE; lx++) {
-                        int fx = px + lx;
-                        if (fx < 0 || fx >= _viewState.viewport_width) continue;
+    // 5. First pass: placeholder tiles (lower zoom, cached only)
+    int placeholderZoom = targetZoom > 2 ? targetZoom - 2 : 0;
+    [self renderPlaceholderTilesAtZoom:placeholderZoom withViewScale:viewScale];
 
-                        _framebuffer[fy * _viewState.viewport_width + fx] =
-                            tileBuf[ly * TILE_SIZE + lx];
-                    }
-                }
-            }
+    // 6. Second pass: render actual tiles
+    for (int64_t ty = startY; ty < endY; ty++) {
+        for (int64_t tx = startX; tx < endX; tx++) {
+            MapTile tile = { .zoom = targetZoom, .x = (uint64_t)tx, .y = (uint64_t)ty };
+            [self renderMapTile:&tile withViewScale:viewScale];
         }
     }
 
-    free(tileBuf);
+    // 7. Upload and present
+    [self uploadAndPresent];
+}
 
-    // Convert RGB to BGRA for Metal texture (CAMetalLayer uses BGRA)
+- (void)uploadAndPresent {
     size_t pixels = (size_t)_viewState.viewport_width * _viewState.viewport_height;
     uint8_t *bgra = malloc(pixels * 4);
     if (!bgra) return;
 
     for (size_t i = 0; i < pixels; i++) {
-        bgra[i * 4 + 0] = _framebuffer[i].b;  // B
-        bgra[i * 4 + 1] = _framebuffer[i].g;  // G
-        bgra[i * 4 + 2] = _framebuffer[i].r;  // R
-        bgra[i * 4 + 3] = 255;                 // A
+        bgra[i * 4 + 0] = _framebuffer[i].b;
+        bgra[i * 4 + 1] = _framebuffer[i].g;
+        bgra[i * 4 + 2] = _framebuffer[i].r;
+        bgra[i * 4 + 3] = 255;
     }
 
-    // Upload to texture
     if (_texture) {
         MTLRegion region = MTLRegionMake2D(0, 0, _viewState.viewport_width, _viewState.viewport_height);
         [_texture replaceRegion:region mipmapLevel:0 withBytes:bgra bytesPerRow:_viewState.viewport_width * 4];
     }
 
     free(bgra);
-
-    // Render texture to screen using Metal
     [self presentTexture];
 }
 
@@ -555,8 +824,19 @@ static MandelbrotView *g_view = nil;
 // Public API
 // =============================================================================
 
-int native_viewer_init(const char *title, int width, int height) {
+int native_viewer_init(const char *title, int width, int height, bool clear_cache) {
     NSLog(@"native_viewer_init: starting");
+
+    // Clear disk cache if requested
+    if (clear_cache) {
+        NSString *cachePath = [@CACHE_PATH stringByExpandingTildeInPath];
+        NSError *error = nil;
+        if ([[NSFileManager defaultManager] removeItemAtPath:cachePath error:&error]) {
+            NSLog(@"Cleared disk cache at %@", cachePath);
+        } else if (error && error.code != NSFileNoSuchFileError) {
+            NSLog(@"Warning: Failed to clear cache at %@: %@", cachePath, error.localizedDescription);
+        }
+    }
 
     // Initialize application
     [NSApplication sharedApplication];

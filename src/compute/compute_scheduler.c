@@ -269,38 +269,50 @@ bool scheduler_get_map_tile(ComputeScheduler *sched, const MapTile *tile,
                             PixelColor *output) {
     if (!sched || !tile || !output) return false;
 
-    // 1. Check disk cache first (if zoom <= 20)
+    // 1. Check disk cache first
     if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && sched->disk_cache) {
         if (disk_cache_get(sched->disk_cache, tile, output) == 0) {
-            return true;  // Cache hit!
+            return true;
         }
     }
 
-    // 2. Compute tile bounds
+    // 2. Get tile bounds
     double min_cx, max_cx, min_cy, max_cy;
     mb_tile_to_bounds(tile, &min_cx, &max_cx, &min_cy, &max_cy);
 
-    // 3. Create view state for this tile
-    MBViewState tile_view;
-    tile_view.center_x = (min_cx + max_cx) / 2.0;
-    tile_view.center_y = (min_cy + max_cy) / 2.0;
-    tile_view.viewport_width = MB_MAP_TILE_SIZE;
-    tile_view.viewport_height = MB_MAP_TILE_SIZE;
+    // 3. Compute separate X and Y scales
+    double scale_x = (max_cx - min_cx) / MB_MAP_TILE_SIZE;
+    double scale_y = (max_cy - min_cy) / MB_MAP_TILE_SIZE;
 
-    // Zoom level = 1 / scale (units per pixel)
-    // scale = tile_width / tile_pixels
-    double tile_width = max_cx - min_cx;
-    double scale = tile_width / MB_MAP_TILE_SIZE;
-    tile_view.zoom_level = (2.0 / tile_view.viewport_height) / scale;
+    // 4. Compute each pixel with correct coordinates
+    for (int ly = 0; ly < MB_MAP_TILE_SIZE; ly++) {
+        double cy = min_cy + (ly + 0.5) * scale_y;
+        for (int lx = 0; lx < MB_MAP_TILE_SIZE; lx++) {
+            double cx = min_cx + (lx + 0.5) * scale_x;
 
-    // 4. Update reference if needed
-    scheduler_update_view(sched, &tile_view);
+            // Compute iteration
+            unsigned int iteration;
+            if (mb_is_in_cardioid_or_bulb(cx, cy)) {
+                iteration = sched->max_iter;
+            } else {
+                double zx = 0.0, zy = 0.0;
+                double zx2 = 0.0, zy2 = 0.0;
+                iteration = 0;
 
-    // 5. Compute tile using existing infrastructure
-    // The tile is at position (0,0) in tile coordinates for this view
-    scheduler_get_tile(sched, &tile_view, 0, 0, output);
+                while (zx2 + zy2 < 4.0 && iteration < (unsigned int)sched->max_iter) {
+                    zy = 2.0 * zx * zy + cy;
+                    zx = zx2 - zy2 + cx;
+                    zx2 = zx * zx;
+                    zy2 = zy * zy;
+                    iteration++;
+                }
+            }
 
-    // 6. Save to disk cache
+            color_from_iteration(&output[ly * MB_MAP_TILE_SIZE + lx], iteration);
+        }
+    }
+
+    // 5. Save to disk cache
     if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && sched->disk_cache) {
         disk_cache_put(sched->disk_cache, tile, output);
     }
