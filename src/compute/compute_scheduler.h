@@ -20,11 +20,18 @@ typedef struct {
     bool gpu_available;
     bool using_double;  // True when zoom >= MB_FLOAT_ZOOM_LIMIT (legacy, unused with perturbation)
 
-    // Perturbation state
+    // Perturbation state (standard double precision)
     ReferenceOrbit ref_orbit;
     bool perturbation_enabled;
     double last_ref_cx, last_ref_cy;
     double last_scale;
+
+    // High-precision perturbation state
+    ReferenceOrbitHP ref_orbit_hp;
+    bool high_precision_mode;
+    uint32_t current_precision;          // Current precision tier (bits)
+    char last_ref_cx_str[MB_HP_COORD_STR_LEN];
+    char last_ref_cy_str[MB_HP_COORD_STR_LEN];
 
     // Reusable buffers (avoid malloc per tile)
     float *delta_buffer;     // Pre-computed deltas for V2 API

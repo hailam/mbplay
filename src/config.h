@@ -1,6 +1,9 @@
 #ifndef MB_CONFIG_H
 #define MB_CONFIG_H
 
+#include <stdbool.h>
+#include <stdio.h>
+
 // =============================================================================
 // Platform Detection
 // =============================================================================
@@ -90,17 +93,6 @@ typedef struct {
 } PixelColor;
 
 // =============================================================================
-// Interactive Viewer State
-// =============================================================================
-
-typedef struct {
-    double center_x, center_y;  // Complex plane center
-    double zoom_level;          // 1.0 = default view, higher = zoomed in
-    int viewport_width;
-    int viewport_height;
-} MBViewState;
-
-// =============================================================================
 // Perturbation Theory Configuration
 // =============================================================================
 
@@ -112,9 +104,44 @@ typedef struct {
 // With perturbation enabled, GPU can render at any zoom level
 #define MB_FLOAT_ZOOM_LIMIT 1e15  // Effectively disabled with perturbation
 
+// =============================================================================
+// High-Precision (Arbitrary Precision) Configuration
+// =============================================================================
+
+// Zoom threshold to switch to high-precision mode
+#define MB_HP_ZOOM_THRESHOLD 1e12
+
+// Precision tiers (bits) based on zoom level
+#define MB_PREC_TIER_1 128   // zoom 1e12 - 1e30
+#define MB_PREC_TIER_2 256   // zoom 1e30 - 1e60
+#define MB_PREC_TIER_3 512   // zoom 1e60 - 1e120
+#define MB_PREC_TIER_4 1024  // zoom > 1e120
+
+// Maximum string length for HP coordinates
+#define MB_HP_COORD_STR_LEN 512
+
+// Maximum zoom level with HP mode (log10 of zoom)
+#define MB_MAX_ZOOM_HP 200
+
 // Tile size for interactive rendering (256x256 pixels, ~64MB for 256 tiles)
 #define MB_INTERACTIVE_TILE_SIZE 256
 #define MB_MAX_CACHED_TILES 256
+
+// =============================================================================
+// Interactive Viewer State
+// =============================================================================
+
+typedef struct {
+    double center_x, center_y;  // Complex plane center (double precision, for display/UI)
+    double zoom_level;          // 1.0 = default view, higher = zoomed in
+    int viewport_width;
+    int viewport_height;
+
+    // High-precision center coordinates (decimal strings)
+    char center_x_str[MB_HP_COORD_STR_LEN];
+    char center_y_str[MB_HP_COORD_STR_LEN];
+    bool high_precision_mode;   // True when zoom exceeds HP threshold
+} MBViewState;
 
 static inline void mb_view_state_init(MBViewState *view, int width, int height) {
     view->center_x = -0.5;
@@ -122,6 +149,11 @@ static inline void mb_view_state_init(MBViewState *view, int width, int height) 
     view->zoom_level = 1.0;
     view->viewport_width = width;
     view->viewport_height = height;
+
+    // Initialize HP center strings
+    snprintf(view->center_x_str, MB_HP_COORD_STR_LEN, "-0.5");
+    snprintf(view->center_y_str, MB_HP_COORD_STR_LEN, "0.0");
+    view->high_precision_mode = false;
 }
 
 // Pixel to complex plane coordinate mapping
@@ -151,6 +183,20 @@ static inline double mb_view_get_scale(const MBViewState *view) {
 // Check if we need double precision at current zoom level
 static inline int mb_view_needs_double(const MBViewState *view) {
     return view->zoom_level >= MB_FLOAT_ZOOM_LIMIT;
+}
+
+// Check if we need high-precision mode at current zoom level
+static inline bool mb_view_needs_high_precision(const MBViewState *view) {
+    return view->zoom_level >= MB_HP_ZOOM_THRESHOLD;
+}
+
+// Set the HP center from doubles (syncs string representations)
+static inline void mb_view_set_center_hp(MBViewState *view, double cx, double cy) {
+    view->center_x = cx;
+    view->center_y = cy;
+    // Store as high-precision string with maximum precision for double
+    snprintf(view->center_x_str, MB_HP_COORD_STR_LEN, "%.17g", cx);
+    snprintf(view->center_y_str, MB_HP_COORD_STR_LEN, "%.17g", cy);
 }
 
 #endif // MB_CONFIG_H

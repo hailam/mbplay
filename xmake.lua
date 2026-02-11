@@ -4,6 +4,8 @@ add_rules("mode.debug", "mode.release")
 add_requires("qoi")
 add_requires("libpng")
 add_requires("libsdl2")
+add_requires("gmp")
+add_requires("mpfr")
 
 -- CMT: Metal C bindings (custom package from git)
 package("cmt")
@@ -86,6 +88,7 @@ target("mandelbrot_interactive")
     add_files("src/tile_map/*.c")
     add_files("src/compute/*.c")
     add_files("src/perturbation/*.c")
+    add_files("src/precision/*.c")
 
     -- CMT Objective-C sources (compiled from package install dir)
     on_load(function (target)
@@ -106,7 +109,7 @@ target("mandelbrot_interactive")
     end
 
     -- Packages (no SDL2!)
-    add_packages("cmt", "qoi")
+    add_packages("cmt", "qoi", "gmp", "mpfr")
     add_includedirs("src")
 
     -- Optimization

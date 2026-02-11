@@ -1,5 +1,6 @@
 #include "gpu.h"
 #include "../color/color.h"
+#include "../precision/mp_real.h"
 
 #ifdef MB_GPU_METAL
 
@@ -854,6 +855,85 @@ void gpu_precompute_deltas(double center_x, double center_y, double scale,
     }
 }
 
+void gpu_precompute_deltas_hp(
+    const char *center_x_str, const char *center_y_str,
+    const char *ref_cx_str, const char *ref_cy_str,
+    uint32_t precision,
+    double scale,
+    uint32_t tile_size, int vp_half_w, int vp_half_h,
+    uint32_t tile_px, uint32_t tile_py,
+    float *delta_buffer)
+{
+    mpfr_prec_t prec = (mpfr_prec_t)precision;
+
+    // Initialize HP values for center and reference
+    MPReal center_x, center_y, ref_cx, ref_cy;
+    mp_real_init_set_str(&center_x, center_x_str, prec);
+    mp_real_init_set_str(&center_y, center_y_str, prec);
+    mp_real_init_set_str(&ref_cx, ref_cx_str, prec);
+    mp_real_init_set_str(&ref_cy, ref_cy_str, prec);
+
+    // Temp variables for pixel coordinate computation
+    MPReal pixel_cx, pixel_cy, delta_cx, delta_cy;
+    MPReal offset, scaled_offset;
+    mp_real_init(&pixel_cx, prec);
+    mp_real_init(&pixel_cy, prec);
+    mp_real_init(&delta_cx, prec);
+    mp_real_init(&delta_cy, prec);
+    mp_real_init(&offset, prec);
+    mp_real_init(&scaled_offset, prec);
+
+    for (uint32_t ly = 0; ly < tile_size; ly++) {
+        // Compute pixel Y offset and scaled offset
+        // offset = (tile_py + ly) - vp_half_h
+        mp_real_set_d(&offset, (double)(tile_py + ly) - vp_half_h);
+
+        // scaled_offset = offset * scale
+        mp_real_mul_d(&scaled_offset, &offset, scale);
+
+        // pixel_cy = center_y + scaled_offset
+        mp_real_add(&pixel_cy, &center_y, &scaled_offset);
+
+        // delta_cy = pixel_cy - ref_cy
+        mp_real_sub(&delta_cy, &pixel_cy, &ref_cy);
+
+        double delta_cy_d = mp_real_get_d(&delta_cy);
+
+        for (uint32_t lx = 0; lx < tile_size; lx++) {
+            // Compute pixel X offset and scaled offset
+            // offset = (tile_px + lx) - vp_half_w
+            mp_real_set_d(&offset, (double)(tile_px + lx) - vp_half_w);
+
+            // scaled_offset = offset * scale
+            mp_real_mul_d(&scaled_offset, &offset, scale);
+
+            // pixel_cx = center_x + scaled_offset
+            mp_real_add(&pixel_cx, &center_x, &scaled_offset);
+
+            // delta_cx = pixel_cx - ref_cx
+            mp_real_sub(&delta_cx, &pixel_cx, &ref_cx);
+
+            double delta_cx_d = mp_real_get_d(&delta_cx);
+
+            size_t idx = (ly * tile_size + lx) * 2;
+            delta_buffer[idx + 0] = (float)delta_cx_d;
+            delta_buffer[idx + 1] = (float)delta_cy_d;
+        }
+    }
+
+    // Cleanup
+    mp_real_clear(&center_x);
+    mp_real_clear(&center_y);
+    mp_real_clear(&ref_cx);
+    mp_real_clear(&ref_cy);
+    mp_real_clear(&pixel_cx);
+    mp_real_clear(&pixel_cy);
+    mp_real_clear(&delta_cx);
+    mp_real_clear(&delta_cy);
+    mp_real_clear(&offset);
+    mp_real_clear(&scaled_offset);
+}
+
 void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
                                   const float *deltas,
                                   PixelColor *output, uint32_t *iterations_out) {
@@ -998,6 +1078,22 @@ void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
     (void)deltas;
     (void)output;
     (void)iterations;
+}
+
+void gpu_precompute_deltas_hp(
+    const char *center_x_str, const char *center_y_str,
+    const char *ref_cx_str, const char *ref_cy_str,
+    uint32_t precision,
+    double scale,
+    uint32_t tile_size, int vp_half_w, int vp_half_h,
+    uint32_t tile_px, uint32_t tile_py,
+    float *delta_buffer) {
+    (void)center_x_str; (void)center_y_str;
+    (void)ref_cx_str; (void)ref_cy_str;
+    (void)precision; (void)scale;
+    (void)tile_size; (void)vp_half_w; (void)vp_half_h;
+    (void)tile_px; (void)tile_py;
+    (void)delta_buffer;
 }
 
 #endif // MB_GPU_METAL

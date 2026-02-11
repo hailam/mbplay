@@ -4,6 +4,7 @@
 #include "../color/color.h"
 #include "../tile_map/tile_map.h"
 #include "../tile_cache/disk_cache.h"
+#include "../precision/mp_real.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -22,9 +23,13 @@ int scheduler_init(ComputeScheduler *sched, int tile_size, int max_iter) {
     sched->max_iter = max_iter;
     sched->using_double = false;
     sched->perturbation_enabled = false;
+    sched->high_precision_mode = false;
+    sched->current_precision = 64;
     sched->last_ref_cx = 0.0;
     sched->last_ref_cy = 0.0;
     sched->last_scale = 0.0;
+    sched->last_ref_cx_str[0] = '\0';
+    sched->last_ref_cy_str[0] = '\0';
 
     // Initialize tile cache
     if (tile_cache_init(&sched->cache) != 0) {
@@ -50,24 +55,100 @@ int scheduler_init(ComputeScheduler *sched, int tile_size, int max_iter) {
                 sched->perturbation_enabled = true;
             }
         }
+
+        // Initialize HP reference orbit with default precision
+        // It will be re-initialized with higher precision as needed
+        if (ref_orbit_hp_init(&sched->ref_orbit_hp, MB_REF_ORBIT_MAX_ITER, MB_PREC_TIER_1) == 0) {
+            // HP orbit initialized successfully
+        }
     }
 
     return 0;
 }
 
+// Calculate required precision tier based on zoom level
+static uint32_t get_precision_tier(double zoom_level) {
+    // log10(zoom) determines number of decimal digits needed
+    // Each decimal digit needs ~3.32 bits
+    if (zoom_level < MB_HP_ZOOM_THRESHOLD) {
+        return 64;  // Standard double precision
+    }
+
+    double log_zoom = log10(zoom_level);
+    if (log_zoom < 30) return MB_PREC_TIER_1;      // 128 bits
+    if (log_zoom < 60) return MB_PREC_TIER_2;      // 256 bits
+    if (log_zoom < 120) return MB_PREC_TIER_3;     // 512 bits
+    return MB_PREC_TIER_4;                          // 1024 bits
+}
+
 void scheduler_update_view(ComputeScheduler *sched, const MBViewState *view) {
     double scale = mb_view_get_scale(view);
+    bool needs_hp = mb_view_needs_high_precision(view);
 
-    // Check if reference orbit needs recomputation
-    // Recompute if: center moved significantly, or scale changed significantly
-    if (sched->perturbation_enabled) {
+    // Check if we're transitioning between HP and standard mode
+    if (needs_hp != sched->high_precision_mode) {
+        sched->high_precision_mode = needs_hp;
+        // Invalidate cache on mode transition
+        tile_cache_new_generation(&sched->cache);
+    }
+
+    if (needs_hp) {
+        // High-precision mode
+        uint32_t required_prec = get_precision_tier(view->zoom_level);
+
+        // Check if we need to upgrade precision
+        if (required_prec > sched->current_precision) {
+            // Reinitialize HP orbit with higher precision
+            ref_orbit_hp_cleanup(&sched->ref_orbit_hp);
+            ref_orbit_hp_init(&sched->ref_orbit_hp, MB_REF_ORBIT_MAX_ITER, required_prec);
+            sched->current_precision = required_prec;
+            sched->ref_orbit_hp.valid = false;
+        }
+
+        // Check if HP reference orbit needs recomputation
+        bool need_recompute = !sched->ref_orbit_hp.valid ||
+                             strcmp(view->center_x_str, sched->last_ref_cx_str) != 0 ||
+                             strcmp(view->center_y_str, sched->last_ref_cy_str) != 0;
+
+        if (need_recompute) {
+            // Compute HP reference at view center
+            ref_orbit_hp_compute(&sched->ref_orbit_hp,
+                                 view->center_x_str, view->center_y_str);
+
+            // Copy HP orbit data to standard ref_orbit struct for GPU upload
+            // (ref_orbit owns its arrays, we copy data into them)
+            sched->ref_orbit.ref_cx = sched->ref_orbit_hp.ref_cx;
+            sched->ref_orbit.ref_cy = sched->ref_orbit_hp.ref_cy;
+            sched->ref_orbit.escape_iter = sched->ref_orbit_hp.escape_iter;
+
+            // Copy the orbit history (computed in HP, stored as doubles)
+            uint32_t copy_count = sched->ref_orbit_hp.escape_iter;
+            if (copy_count > sched->ref_orbit.max_iter) {
+                copy_count = sched->ref_orbit.max_iter;
+            }
+            for (uint32_t i = 0; i < copy_count; i++) {
+                sched->ref_orbit.z_real[i] = sched->ref_orbit_hp.z_real[i];
+                sched->ref_orbit.z_imag[i] = sched->ref_orbit_hp.z_imag[i];
+            }
+            sched->ref_orbit.valid = sched->ref_orbit_hp.valid;
+
+            gpu_update_reference_orbit(&sched->ref_orbit);
+
+            strncpy(sched->last_ref_cx_str, view->center_x_str, MB_HP_COORD_STR_LEN - 1);
+            sched->last_ref_cx_str[MB_HP_COORD_STR_LEN - 1] = '\0';
+            strncpy(sched->last_ref_cy_str, view->center_y_str, MB_HP_COORD_STR_LEN - 1);
+            sched->last_ref_cy_str[MB_HP_COORD_STR_LEN - 1] = '\0';
+            sched->last_ref_cx = sched->ref_orbit_hp.ref_cx;
+            sched->last_ref_cy = sched->ref_orbit_hp.ref_cy;
+            sched->last_scale = scale;
+        }
+    } else if (sched->perturbation_enabled) {
+        // Standard double precision mode
         double center_dist = fabs(view->center_x - sched->last_ref_cx) +
                             fabs(view->center_y - sched->last_ref_cy);
         double scale_ratio = sched->last_scale > 0 ? scale / sched->last_scale : 0;
 
         // Recompute if center moved more than 50% of viewport, or scale changed >50%
-        // Relaxed threshold - V2 API handles precision correctly so we don't need
-        // to recompute reference as often
         bool need_recompute = !sched->ref_orbit.valid ||
                              center_dist > scale * view->viewport_width * 0.5 ||
                              scale_ratio < 0.5 || scale_ratio > 2.0;
@@ -80,10 +161,6 @@ void scheduler_update_view(ComputeScheduler *sched, const MBViewState *view) {
             sched->last_ref_cx = view->center_x;
             sched->last_ref_cy = view->center_y;
             sched->last_scale = scale;
-
-            // NOTE: No cache invalidation on reference change.
-            // With V2 API, deltas are computed per-tile with the current
-            // reference, so cached tiles remain valid.
         }
     }
 
@@ -164,11 +241,22 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
 
     // Use perturbation V2 if enabled and reference is valid
     if (sched->perturbation_enabled && sched->ref_orbit.valid) {
-        // Pre-compute deltas on CPU (double precision)
-        gpu_precompute_deltas(view->center_x, view->center_y, scale,
-                              sched->ref_orbit.ref_cx, sched->ref_orbit.ref_cy,
-                              (uint32_t)sched->tile_size, vp_half_w, vp_half_h,
-                              (uint32_t)px, (uint32_t)py, sched->delta_buffer);
+        // Pre-compute deltas on CPU
+        if (sched->high_precision_mode && sched->ref_orbit_hp.valid) {
+            // High-precision mode: use MPFR for accurate delta computation
+            gpu_precompute_deltas_hp(
+                view->center_x_str, view->center_y_str,
+                sched->ref_orbit_hp.ref_cx_str, sched->ref_orbit_hp.ref_cy_str,
+                sched->current_precision, scale,
+                (uint32_t)sched->tile_size, vp_half_w, vp_half_h,
+                (uint32_t)px, (uint32_t)py, sched->delta_buffer);
+        } else {
+            // Standard double precision delta computation
+            gpu_precompute_deltas(view->center_x, view->center_y, scale,
+                                  sched->ref_orbit.ref_cx, sched->ref_orbit.ref_cy,
+                                  (uint32_t)sched->tile_size, vp_half_w, vp_half_h,
+                                  (uint32_t)px, (uint32_t)py, sched->delta_buffer);
+        }
 
         // Compute with pre-computed deltas (V2 API)
         GPUPerturbParamsV2 params = {
@@ -235,6 +323,7 @@ bool scheduler_using_double(const ComputeScheduler *sched) {
 void scheduler_cleanup(ComputeScheduler *sched) {
     tile_cache_cleanup(&sched->cache);
     ref_orbit_cleanup(&sched->ref_orbit);
+    ref_orbit_hp_cleanup(&sched->ref_orbit_hp);
     if (sched->gpu_available) {
         gpu_cleanup();
     }

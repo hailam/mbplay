@@ -61,6 +61,10 @@
 
     // HUD display
     BOOL _showHUD;
+
+    // High-precision mode tracking
+    BOOL _highPrecisionMode;
+    uint32_t _currentPrecision;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect;
@@ -158,6 +162,10 @@
 
         // HUD enabled by default
         _showHUD = YES;
+
+        // High-precision mode tracking
+        _highPrecisionMode = NO;
+        _currentPrecision = 64;
 
         // Set up display timer for 60fps (simpler than CVDisplayLink, avoids threading issues)
         _displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60.0
@@ -295,6 +303,37 @@
 }
 
 // =============================================================================
+// High-Precision Mode Helpers
+// =============================================================================
+
+- (void)updateHPMode {
+    BOOL needsHP = _viewState.zoom_level >= MB_HP_ZOOM_THRESHOLD;
+
+    if (needsHP != _highPrecisionMode) {
+        _highPrecisionMode = needsHP;
+        _viewState.high_precision_mode = needsHP;
+
+        if (needsHP) {
+            // Calculate precision tier
+            double log_zoom = log10(_viewState.zoom_level);
+            if (log_zoom < 30) _currentPrecision = MB_PREC_TIER_1;
+            else if (log_zoom < 60) _currentPrecision = MB_PREC_TIER_2;
+            else if (log_zoom < 120) _currentPrecision = MB_PREC_TIER_3;
+            else _currentPrecision = MB_PREC_TIER_4;
+        } else {
+            _currentPrecision = 64;
+        }
+    }
+}
+
+- (void)syncHPCenterStrings {
+    // Sync HP center strings from double values
+    // This is used when transitioning into HP mode or after pan operations
+    snprintf(_viewState.center_x_str, MB_HP_COORD_STR_LEN, "%.17g", _viewState.center_x);
+    snprintf(_viewState.center_y_str, MB_HP_COORD_STR_LEN, "%.17g", _viewState.center_y);
+}
+
+// =============================================================================
 // Zoom towards point math
 // =============================================================================
 
@@ -307,14 +346,18 @@
     // Apply zoom
     _viewState.zoom_level *= delta;
 
-    // Clamp zoom level
+    // Clamp zoom level (extended max for HP mode)
     if (_viewState.zoom_level < 0.1) _viewState.zoom_level = 0.1;
-    if (_viewState.zoom_level > 1e15) _viewState.zoom_level = 1e15;
+    if (_viewState.zoom_level > 1e100) _viewState.zoom_level = 1e100;
 
     // Recalculate center so mouse point stays fixed
     double new_scale = mb_view_get_scale(&_viewState);
     _viewState.center_x = mouse_cx - (point.x - _viewState.viewport_width / 2.0) * new_scale;
     _viewState.center_y = mouse_cy + (point.y - _viewState.viewport_height / 2.0) * new_scale;
+
+    // Update HP mode and sync strings
+    [self updateHPMode];
+    [self syncHPCenterStrings];
 }
 
 // =============================================================================
@@ -344,6 +387,11 @@
         double scale = mb_view_get_scale(&_viewState);
         _viewState.center_x -= event.scrollingDeltaX * scale;
         _viewState.center_y += event.scrollingDeltaY * scale;
+
+        // Sync HP strings if in HP mode
+        if (_highPrecisionMode) {
+            [self syncHPCenterStrings];
+        }
     }
     [self invalidateCache];
 }
@@ -362,6 +410,11 @@
     double scale = mb_view_get_scale(&_viewState);
     _viewState.center_x -= (loc.x - _lastDragPoint.x) * scale;
     _viewState.center_y += (loc.y - _lastDragPoint.y) * scale;
+
+    // Sync HP strings if in HP mode
+    if (_highPrecisionMode) {
+        [self syncHPCenterStrings];
+    }
 
     _lastDragPoint = loc;
     [self invalidateCache];
@@ -390,6 +443,8 @@
         case 'R':
             // Reset view
             mb_view_state_init(&_viewState, _viewState.viewport_width, _viewState.viewport_height);
+            _highPrecisionMode = NO;
+            _currentPrecision = 64;
             [self invalidateCache];
             return;
         case '=':
@@ -405,18 +460,22 @@
             return;
         case NSUpArrowFunctionKey:
             _viewState.center_y -= panAmount;
+            if (_highPrecisionMode) [self syncHPCenterStrings];
             [self invalidateCache];
             return;
         case NSDownArrowFunctionKey:
             _viewState.center_y += panAmount;
+            if (_highPrecisionMode) [self syncHPCenterStrings];
             [self invalidateCache];
             return;
         case NSLeftArrowFunctionKey:
             _viewState.center_x -= panAmount;
+            if (_highPrecisionMode) [self syncHPCenterStrings];
             [self invalidateCache];
             return;
         case NSRightArrowFunctionKey:
             _viewState.center_x += panAmount;
+            if (_highPrecisionMode) [self syncHPCenterStrings];
             [self invalidateCache];
             return;
         case 27: // Escape
@@ -845,7 +904,14 @@
     [_asyncCacheLock unlock];
 
     // Build HUD text
-    NSString *zoomLine = [NSString stringWithFormat:@"Zoom: %.2fx", _viewState.zoom_level];
+    NSString *zoomLine;
+    if (_viewState.zoom_level >= 1e15) {
+        // Use scientific notation for extreme zoom
+        zoomLine = [NSString stringWithFormat:@"Zoom: %.2e", _viewState.zoom_level];
+    } else {
+        zoomLine = [NSString stringWithFormat:@"Zoom: %.2fx", _viewState.zoom_level];
+    }
+
     NSString *centerLine;
     if (_viewState.center_y >= 0) {
         centerLine = [NSString stringWithFormat:@"Center: %.6f + %.6fi", _viewState.center_x, _viewState.center_y];
@@ -853,18 +919,26 @@
         centerLine = [NSString stringWithFormat:@"Center: %.6f - %.6fi", _viewState.center_x, -_viewState.center_y];
     }
     NSString *scaleLine = [NSString stringWithFormat:@"Scale: %.2e", scale];
+
+    NSString *precLine;
+    if (_highPrecisionMode) {
+        precLine = [NSString stringWithFormat:@"Precision: %u bits (HP)", _currentPrecision];
+    } else {
+        precLine = @"Precision: 64 bits (double)";
+    }
+
     NSString *tilesLine = [NSString stringWithFormat:@"Tiles: %lu cached, %lu pending",
                           (unsigned long)cachedCount, (unsigned long)pendingCount];
     NSString *helpLine = @"Press 'I' to toggle HUD";
 
-    NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@",
-                        zoomLine, centerLine, scaleLine, tilesLine, helpLine];
+    NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@\n%@",
+                        zoomLine, centerLine, scaleLine, precLine, tilesLine, helpLine];
 
     // HUD dimensions
     int padding = 10;
     int lineHeight = 16;
     int hudWidth = 280;
-    int hudHeight = lineHeight * 5 + padding * 2;
+    int hudHeight = lineHeight * 6 + padding * 2;  // 6 lines now with precision
 
     // Position in top-right corner
     int hudX = _viewState.viewport_width - hudWidth - padding;

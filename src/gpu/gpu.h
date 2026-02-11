@@ -184,4 +184,35 @@ void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
                                   const float *deltas,
                                   PixelColor *output, uint32_t *iterations);
 
+// =============================================================================
+// High-Precision Delta Computation API
+// =============================================================================
+
+/**
+ * Pre-compute deltas on CPU using arbitrary precision math.
+ * This is for deep zoom levels where double precision is insufficient
+ * for accurate center coordinate representation.
+ *
+ * @param center_x_str View center X as decimal string
+ * @param center_y_str View center Y as decimal string
+ * @param ref_cx_str Reference point C real as decimal string
+ * @param ref_cy_str Reference point C imaginary as decimal string
+ * @param precision Bits of precision to use (128, 256, 512, etc.)
+ * @param scale Complex units per pixel (double precision OK)
+ * @param tile_size Tile dimension
+ * @param vp_half_w Half viewport width
+ * @param vp_half_h Half viewport height
+ * @param tile_px Tile X offset in pixels
+ * @param tile_py Tile Y offset in pixels
+ * @param delta_buffer Output buffer for float2 deltas (tile_size^2 * 2 floats)
+ */
+void gpu_precompute_deltas_hp(
+    const char *center_x_str, const char *center_y_str,
+    const char *ref_cx_str, const char *ref_cy_str,
+    uint32_t precision,
+    double scale,
+    uint32_t tile_size, int vp_half_w, int vp_half_h,
+    uint32_t tile_px, uint32_t tile_py,
+    float *delta_buffer);
+
 #endif // MB_GPU_H
