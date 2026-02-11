@@ -1,6 +1,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <CoreText/CoreText.h>
 #include "native_viewer.h"
 #include "../compute/compute_scheduler.h"
 #include "../tile_map/tile_map.h"
@@ -54,6 +55,12 @@
     NSMutableSet<NSString *> *_pendingTiles;
     NSMutableDictionary<NSString *, NSData *> *_asyncTileCache;
     NSLock *_asyncCacheLock;
+
+    // Parent tile fallback buffer
+    PixelColor *_parentTileBuf;
+
+    // HUD display
+    BOOL _showHUD;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect;
@@ -138,6 +145,20 @@
         _asyncTileCache = [[NSMutableDictionary alloc] init];
         _asyncCacheLock = [[NSLock alloc] init];
 
+        // Parent tile fallback buffer
+        _parentTileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
+        if (!_parentTileBuf) {
+            NSLog(@"Failed to allocate parent tile buffer");
+            free(_mapTileBuf);
+            free(_scaledTileBuf);
+            free(_framebuffer);
+            scheduler_cleanup(&_scheduler);
+            return nil;
+        }
+
+        // HUD enabled by default
+        _showHUD = YES;
+
         // Set up display timer for 60fps (simpler than CVDisplayLink, avoids threading issues)
         _displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60.0
                                                          target:self
@@ -165,6 +186,9 @@
     }
     if (_scaledTileBuf) {
         free(_scaledTileBuf);
+    }
+    if (_parentTileBuf) {
+        free(_parentTileBuf);
     }
     scheduler_cleanup(&_scheduler);
     if (_texture) {
@@ -337,7 +361,7 @@
 
     double scale = mb_view_get_scale(&_viewState);
     _viewState.center_x -= (loc.x - _lastDragPoint.x) * scale;
-    _viewState.center_y -= (loc.y - _lastDragPoint.y) * scale;
+    _viewState.center_y += (loc.y - _lastDragPoint.y) * scale;
 
     _lastDragPoint = loc;
     [self invalidateCache];
@@ -397,6 +421,11 @@
             return;
         case 27: // Escape
             [self.window close];
+            return;
+        case 'i':
+        case 'I':
+            _showHUD = !_showHUD;
+            _needsRedraw = YES;
             return;
         default:
             [super keyDown:event];
@@ -558,6 +587,96 @@
     });
 }
 
+- (BOOL)getParentTileData:(const MapTile *)tile buffer:(PixelColor *)output {
+    if (tile->zoom <= 0) return NO;
+
+    MapTile parent = {
+        .zoom = tile->zoom - 1,
+        .x = tile->x / 2,
+        .y = tile->y / 2
+    };
+
+    // Check async cache first
+    if ([self getTileFromAsyncCache:&parent output:output]) return YES;
+
+    // Then check disk cache
+    if (parent.zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache &&
+        disk_cache_get(_scheduler.disk_cache, &parent, output) == 0) return YES;
+
+    // Recursively try grandparent
+    return [self getParentTileData:&parent buffer:output];
+}
+
+- (int)getParentZoomOffset:(const MapTile *)tile {
+    // Returns how many zoom levels up we had to go to find a cached parent
+    if (tile->zoom <= 0) return -1;
+
+    MapTile parent = {
+        .zoom = tile->zoom - 1,
+        .x = tile->x / 2,
+        .y = tile->y / 2
+    };
+
+    // Check async cache first
+    if ([self getTileFromAsyncCache:&parent output:_parentTileBuf]) return 1;
+
+    // Then check disk cache
+    if (parent.zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache &&
+        disk_cache_get(_scheduler.disk_cache, &parent, _parentTileBuf) == 0) return 1;
+
+    // Recursively try grandparent
+    int parentOffset = [self getParentZoomOffset:&parent];
+    if (parentOffset > 0) return parentOffset + 1;
+
+    return -1;
+}
+
+- (void)blitTileQuadrant:(PixelColor *)src
+               quadrantX:(int)qx quadrantY:(int)qy
+               zoomOffset:(int)zoomOffset
+                  toRect:(NSRect)destRect {
+    // Blit a portion of the source tile (quadrant determined by zoomOffset) to destRect
+    // zoomOffset = 1 means blit 1/2 of tile (128x128 region)
+    // zoomOffset = 2 means blit 1/4 of tile (64x64 region)
+    // etc.
+
+    int dx0 = MAX(0, (int)destRect.origin.x);
+    int dy0 = MAX(0, (int)destRect.origin.y);
+    int dx1 = MIN(_viewState.viewport_width, (int)(destRect.origin.x + destRect.size.width));
+    int dy1 = MIN(_viewState.viewport_height, (int)(destRect.origin.y + destRect.size.height));
+
+    if (dx1 <= dx0 || dy1 <= dy0 || destRect.size.width <= 0 || destRect.size.height <= 0) {
+        return;
+    }
+
+    // Calculate source region within the parent tile
+    int divisor = 1 << zoomOffset;  // 2 for zoomOffset=1, 4 for zoomOffset=2, etc.
+    int srcRegionSize = MB_MAP_TILE_SIZE / divisor;
+    int srcX0 = qx * srcRegionSize;
+    int srcY0 = qy * srcRegionSize;
+
+    double scaleX = (double)srcRegionSize / destRect.size.width;
+    double scaleY = (double)srcRegionSize / destRect.size.height;
+
+    for (int dy = dy0; dy < dy1; dy++) {
+        // Y is inverted in screen space
+        double sy = srcY0 + (destRect.size.height - 1 - (dy - destRect.origin.y)) * scaleY;
+        int syi = (int)sy;
+        if (syi >= srcY0 + srcRegionSize) syi = srcY0 + srcRegionSize - 1;
+        if (syi < srcY0) syi = srcY0;
+
+        for (int dx = dx0; dx < dx1; dx++) {
+            double sx = srcX0 + (dx - destRect.origin.x) * scaleX;
+            int sxi = (int)sx;
+            if (sxi >= srcX0 + srcRegionSize) sxi = srcX0 + srcRegionSize - 1;
+            if (sxi < srcX0) sxi = srcX0;
+
+            _framebuffer[dy * _viewState.viewport_width + dx] =
+                src[syi * MB_MAP_TILE_SIZE + sxi];
+        }
+    }
+}
+
 - (void)renderMapTile:(const MapTile *)tile withViewScale:(double)viewScale {
     BOOL tileReady = NO;
 
@@ -579,14 +698,7 @@
         }
     }
 
-    // 3. If still not ready, queue async computation
-    if (!tileReady) {
-        MapTile tileCopy = *tile;
-        [self queueAsyncTileComputation:tileCopy];
-        return;  // Don't render - placeholder tiles will show instead
-    }
-
-    // Get tile bounds in complex plane
+    // Get tile bounds in complex plane (needed for screen coords calculation)
     double min_cx, max_cx, min_cy, max_cy;
     mb_tile_to_bounds(tile, &min_cx, &max_cx, &min_cy, &max_cy);
 
@@ -599,11 +711,44 @@
     int screen_x1 = (int)((max_cx - _viewState.center_x) / viewScale + vp_half_w);
     int screen_y1 = (int)((_viewState.center_y - min_cy) / viewScale + vp_half_h);  // Y inverted: min_cy → bottom of screen
 
-    [self blitTile:_mapTileBuf
-          fromSize:MB_MAP_TILE_SIZE
-            toRect:NSMakeRect(screen_x0, screen_y0,
-                              screen_x1 - screen_x0,
-                              screen_y1 - screen_y0)];
+    NSRect screenRect = NSMakeRect(screen_x0, screen_y0, screen_x1 - screen_x0, screen_y1 - screen_y0);
+
+    // 3. If still not ready, try parent tile fallback, then queue async computation
+    if (!tileReady) {
+        MapTile tileCopy = *tile;
+        [self queueAsyncTileComputation:tileCopy];
+
+        // Try to render parent tile as placeholder
+        if ([self getParentTileData:tile buffer:_parentTileBuf]) {
+            // Calculate how many zoom levels up we went
+            int zoomOffset = 1;
+            MapTile parent = { .zoom = tile->zoom - 1, .x = tile->x / 2, .y = tile->y / 2 };
+
+            // Check if this parent was the one that matched
+            if (![self getTileFromAsyncCache:&parent output:_mapTileBuf] &&
+                (parent.zoom > MB_DISK_CACHE_MAX_ZOOM || !_scheduler.disk_cache ||
+                 disk_cache_get(_scheduler.disk_cache, &parent, _mapTileBuf) != 0)) {
+                // Parent didn't match, must be grandparent or further up
+                zoomOffset = 2;
+                MapTile grandparent = { .zoom = tile->zoom - 2, .x = tile->x / 4, .y = tile->y / 4 };
+                if (![self getTileFromAsyncCache:&grandparent output:_mapTileBuf] &&
+                    (grandparent.zoom > MB_DISK_CACHE_MAX_ZOOM || !_scheduler.disk_cache ||
+                     disk_cache_get(_scheduler.disk_cache, &grandparent, _mapTileBuf) != 0)) {
+                    zoomOffset = 3;
+                }
+            }
+
+            // Calculate which sub-region of the ancestor corresponds to this tile
+            int mask = (1 << zoomOffset) - 1;
+            int qx = tile->x & mask;
+            int qy = tile->y & mask;
+
+            [self blitTileQuadrant:_parentTileBuf quadrantX:qx quadrantY:qy zoomOffset:zoomOffset toRect:screenRect];
+        }
+        return;
+    }
+
+    [self blitTile:_mapTileBuf fromSize:MB_MAP_TILE_SIZE toRect:screenRect];
 }
 
 - (void)renderPlaceholderTilesAtZoom:(int)zoom withViewScale:(double)viewScale {
@@ -680,8 +825,143 @@
         }
     }
 
-    // 7. Upload and present
+    // 7. Draw HUD if enabled
+    if (_showHUD) {
+        [self drawHUDToFramebuffer];
+    }
+
+    // 8. Upload and present
     [self uploadAndPresent];
+}
+
+- (void)drawHUDToFramebuffer {
+    // Format info strings
+    double scale = mb_view_get_scale(&_viewState);
+
+    // Count pending tiles
+    [_asyncCacheLock lock];
+    NSUInteger pendingCount = _pendingTiles.count;
+    NSUInteger cachedCount = _asyncTileCache.count;
+    [_asyncCacheLock unlock];
+
+    // Build HUD text
+    NSString *zoomLine = [NSString stringWithFormat:@"Zoom: %.2fx", _viewState.zoom_level];
+    NSString *centerLine;
+    if (_viewState.center_y >= 0) {
+        centerLine = [NSString stringWithFormat:@"Center: %.6f + %.6fi", _viewState.center_x, _viewState.center_y];
+    } else {
+        centerLine = [NSString stringWithFormat:@"Center: %.6f - %.6fi", _viewState.center_x, -_viewState.center_y];
+    }
+    NSString *scaleLine = [NSString stringWithFormat:@"Scale: %.2e", scale];
+    NSString *tilesLine = [NSString stringWithFormat:@"Tiles: %lu cached, %lu pending",
+                          (unsigned long)cachedCount, (unsigned long)pendingCount];
+    NSString *helpLine = @"Press 'I' to toggle HUD";
+
+    NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@",
+                        zoomLine, centerLine, scaleLine, tilesLine, helpLine];
+
+    // HUD dimensions
+    int padding = 10;
+    int lineHeight = 16;
+    int hudWidth = 280;
+    int hudHeight = lineHeight * 5 + padding * 2;
+
+    // Position in top-right corner
+    int hudX = _viewState.viewport_width - hudWidth - padding;
+    int hudY = padding;
+
+    // Draw semi-transparent background (50% alpha black)
+    for (int y = hudY; y < hudY + hudHeight && y < _viewState.viewport_height; y++) {
+        for (int x = hudX; x < hudX + hudWidth && x < _viewState.viewport_width; x++) {
+            if (x >= 0) {
+                int idx = y * _viewState.viewport_width + x;
+                // Alpha blend: dst = src * alpha + dst * (1 - alpha)
+                // With 50% alpha black: dst = dst * 0.5
+                _framebuffer[idx].r = _framebuffer[idx].r / 2;
+                _framebuffer[idx].g = _framebuffer[idx].g / 2;
+                _framebuffer[idx].b = _framebuffer[idx].b / 2;
+            }
+        }
+    }
+
+    // Create bitmap context for text rendering
+    int textWidth = hudWidth - padding * 2;
+    int textHeight = hudHeight - padding;
+    size_t textPixels = textWidth * textHeight;
+    uint8_t *textBitmap = calloc(textPixels * 4, 1);
+    if (!textBitmap) return;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(textBitmap, textWidth, textHeight, 8,
+                                              textWidth * 4, colorSpace,
+                                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) {
+        free(textBitmap);
+        return;
+    }
+
+    // Set up text attributes using NSFont for NSAttributedString drawing
+    NSFont *font = [NSFont fontWithName:@"Menlo" size:12.0];
+    if (!font) font = [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular];
+    NSColor *textColor = [NSColor whiteColor];
+
+    NSDictionary *attributes = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: textColor
+    };
+
+    NSAttributedString *attrStr = [[NSAttributedString alloc] initWithString:hudText
+                                                                  attributes:attributes];
+
+    // Use NSGraphicsContext for proper text drawing with flipped coordinates
+    NSGraphicsContext *nsContext = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:nsContext];
+
+    // Draw text
+    [attrStr drawInRect:NSMakeRect(0, 0, textWidth, textHeight)];
+
+    [NSGraphicsContext restoreGraphicsState];
+
+    // Copy text bitmap to framebuffer with alpha blending
+    // Flip Y because CG uses bottom-left origin, framebuffer uses top-left
+    int textStartX = hudX + padding;
+    int textStartY = hudY + padding / 2;
+
+    for (int ty = 0; ty < textHeight; ty++) {
+        int srcY = textHeight - 1 - ty;  // Flip: top of framebuffer gets bottom of CG bitmap
+        int dstY = textStartY + ty;
+
+        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
+
+        for (int tx = 0; tx < textWidth; tx++) {
+            int dstX = textStartX + tx;
+            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
+
+            int srcIdx = srcY * textWidth + tx;
+            int dstIdx = dstY * _viewState.viewport_width + dstX;
+
+            // Get source RGBA
+            uint8_t sr = textBitmap[srcIdx * 4 + 0];
+            uint8_t sg = textBitmap[srcIdx * 4 + 1];
+            uint8_t sb = textBitmap[srcIdx * 4 + 2];
+            uint8_t sa = textBitmap[srcIdx * 4 + 3];
+
+            if (sa > 0) {
+                // Alpha blend
+                float alpha = sa / 255.0f;
+                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
+                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
+                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
+            }
+        }
+    }
+
+    // Cleanup
+    [attrStr release];
+    CGContextRelease(ctx);
+    free(textBitmap);
 }
 
 - (void)uploadAndPresent {

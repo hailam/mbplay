@@ -102,7 +102,7 @@ target("mandelbrot_interactive")
 
     -- Frameworks (macOS only)
     if is_plat("macosx") then
-        add_frameworks("Metal", "Foundation", "QuartzCore", "AppKit", "CoreVideo")
+        add_frameworks("Metal", "Foundation", "QuartzCore", "AppKit", "CoreVideo", "CoreText", "CoreGraphics")
     end
 
     -- Packages (no SDL2!)
