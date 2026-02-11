@@ -34,7 +34,7 @@ typedef struct {
     char last_ref_cy_str[MB_HP_COORD_STR_LEN];
 
     // Reusable buffers (avoid malloc per tile)
-    float *delta_buffer;     // Pre-computed deltas for V2 API
+    double *delta_buffer;    // Pre-computed deltas for V2 API (double precision)
     uint32_t *iter_buffer;   // Iteration output for glitch detection
 } ComputeScheduler;
 

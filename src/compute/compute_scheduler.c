@@ -38,7 +38,7 @@ int scheduler_init(ComputeScheduler *sched, int tile_size, int max_iter) {
 
     // Allocate reusable buffers
     size_t tilePixels = (size_t)tile_size * tile_size;
-    sched->delta_buffer = (float *)malloc(tilePixels * 2 * sizeof(float));
+    sched->delta_buffer = (double *)malloc(tilePixels * 2 * sizeof(double));
     sched->iter_buffer = (uint32_t *)malloc(tilePixels * sizeof(uint32_t));
     if (!sched->delta_buffer || !sched->iter_buffer) {
         scheduler_cleanup(sched);

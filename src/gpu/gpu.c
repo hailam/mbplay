@@ -189,36 +189,36 @@ static const char *METAL_SHADER_SOURCE =
 "kernel void mandelbrot_compute_perturb_v2(\n"
 "    device uint *iterations [[buffer(0)]],\n"
 "    constant PerturbParamsV2 &params [[buffer(1)]],\n"
-"    constant float2 *ref_orbit [[buffer(2)]],\n"
-"    constant float2 *pixel_deltas [[buffer(3)]],\n"
+"    constant double2 *ref_orbit [[buffer(2)]],\n"
+"    constant double2 *pixel_deltas [[buffer(3)]],\n"
 "    uint2 gid [[thread_position_in_grid]]\n"
 ") {\n"
 "    if (gid.x >= params.tile_size || gid.y >= params.tile_size) return;\n"
 "\n"
 "    uint idx = gid.y * params.tile_size + gid.x;\n"
-"    float2 delta_c = pixel_deltas[idx];  // Pre-computed on CPU!\n"
+"    double2 delta_c = pixel_deltas[idx];  // Pre-computed on CPU in double precision!\n"
 "\n"
-"    float delta_x = 0.0f, delta_y = 0.0f;\n"
+"    double delta_x = 0.0, delta_y = 0.0;\n"
 "    uint iteration = 0;\n"
 "    uint max_safe = min(params.max_iter, params.ref_escape_iter);\n"
 "\n"
 "    while (iteration < max_safe) {\n"
-"        float2 z_ref = ref_orbit[iteration];\n"
-"        float zx = z_ref.x + delta_x;\n"
-"        float zy = z_ref.y + delta_y;\n"
+"        double2 z_ref = ref_orbit[iteration];\n"
+"        double zx = z_ref.x + delta_x;\n"
+"        double zy = z_ref.y + delta_y;\n"
 "\n"
-"        if (zx*zx + zy*zy >= 4.0f) break;\n"
+"        if (zx*zx + zy*zy >= 4.0) break;\n"
 "\n"
 "        // d_n+1 = 2*Z_ref*d + d^2 + dC\n"
-"        float new_dx = 2.0f*(z_ref.x*delta_x - z_ref.y*delta_y)\n"
+"        double new_dx = 2.0*(z_ref.x*delta_x - z_ref.y*delta_y)\n"
 "                     + delta_x*delta_x - delta_y*delta_y + delta_c.x;\n"
-"        float new_dy = 2.0f*(z_ref.x*delta_y + z_ref.y*delta_x)\n"
-"                     + 2.0f*delta_x*delta_y + delta_c.y;\n"
+"        double new_dy = 2.0*(z_ref.x*delta_y + z_ref.y*delta_x)\n"
+"                     + 2.0*delta_x*delta_y + delta_c.y;\n"
 "\n"
 "        // Glitch detection: delta magnitude too large relative to reference\n"
-"        float delta_mag = new_dx*new_dx + new_dy*new_dy;\n"
-"        float ref_mag = z_ref.x*z_ref.x + z_ref.y*z_ref.y;\n"
-"        if (delta_mag > ref_mag * 1e6f && ref_mag > 1e-10f) {\n"
+"        double delta_mag = new_dx*new_dx + new_dy*new_dy;\n"
+"        double ref_mag = z_ref.x*z_ref.x + z_ref.y*z_ref.y;\n"
+"        if (delta_mag > ref_mag * 1e6 && ref_mag > 1e-10) {\n"
 "            iterations[idx] = 0xFFFFFFFE;\n"
 "            return;\n"
 "        }\n"
@@ -701,8 +701,8 @@ int gpu_init_perturbation(uint32_t max_iter) {
     }
 
     // Allocate perturbation buffers
-    // Reference orbit: array of float2 (8 bytes per iteration)
-    size_t refOrbitSize = max_iter * 2 * sizeof(float);
+    // Reference orbit: array of double2 (16 bytes per iteration)
+    size_t refOrbitSize = max_iter * 2 * sizeof(double);
     refOrbitBuffer = mtDeviceNewBufferWithLength(device, refOrbitSize, MtResourceStorageModeShared);
 
     // Params buffer
@@ -736,8 +736,8 @@ int gpu_init_perturbation(uint32_t max_iter) {
     // Allocate V2 buffers
     perturbParamsV2Buffer = mtDeviceNewBufferWithLength(device, sizeof(PerturbParamsV2), MtResourceStorageModeShared);
 
-    // Delta buffer: 2 floats per pixel (tile_size^2 * 2 * sizeof(float))
-    size_t deltaBufferSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * 2 * sizeof(float);
+    // Delta buffer: 2 doubles per pixel (tile_size^2 * 2 * sizeof(double))
+    size_t deltaBufferSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * 2 * sizeof(double);
     deltaBuffer = mtDeviceNewBufferWithLength(device, deltaBufferSize, MtResourceStorageModeShared);
 
     if (!perturbParamsV2Buffer || !deltaBuffer) {
@@ -756,13 +756,13 @@ void gpu_update_reference_orbit(const ReferenceOrbit *orbit) {
         return;
     }
 
-    // Copy reference orbit to GPU as float2 array
-    float *buffer = mtBufferContents(refOrbitBuffer);
+    // Copy reference orbit to GPU as double2 array
+    double *buffer = mtBufferContents(refOrbitBuffer);
     uint32_t count = orbit->escape_iter < perturbMaxIter ? orbit->escape_iter : perturbMaxIter;
 
     for (uint32_t i = 0; i < count; i++) {
-        buffer[i * 2 + 0] = (float)orbit->z_real[i];
-        buffer[i * 2 + 1] = (float)orbit->z_imag[i];
+        buffer[i * 2 + 0] = orbit->z_real[i];
+        buffer[i * 2 + 1] = orbit->z_imag[i];
     }
 }
 
@@ -839,7 +839,7 @@ void gpu_precompute_deltas(double center_x, double center_y, double scale,
                            double ref_cx, double ref_cy,
                            uint32_t tile_size, int vp_half_w, int vp_half_h,
                            uint32_t tile_px, uint32_t tile_py,
-                           float *delta_buffer) {
+                           double *delta_buffer) {
     for (uint32_t ly = 0; ly < tile_size; ly++) {
         double py = (double)(tile_py + ly);
         double delta_cy = center_y + (py - vp_half_h) * scale - ref_cy;
@@ -849,8 +849,8 @@ void gpu_precompute_deltas(double center_x, double center_y, double scale,
             double delta_cx = center_x + (px - vp_half_w) * scale - ref_cx;
 
             size_t idx = (ly * tile_size + lx) * 2;
-            delta_buffer[idx + 0] = (float)delta_cx;
-            delta_buffer[idx + 1] = (float)delta_cy;
+            delta_buffer[idx + 0] = delta_cx;
+            delta_buffer[idx + 1] = delta_cy;
         }
     }
 }
@@ -862,7 +862,7 @@ void gpu_precompute_deltas_hp(
     double scale,
     uint32_t tile_size, int vp_half_w, int vp_half_h,
     uint32_t tile_px, uint32_t tile_py,
-    float *delta_buffer)
+    double *delta_buffer)
 {
     mpfr_prec_t prec = (mpfr_prec_t)precision;
 
@@ -916,8 +916,8 @@ void gpu_precompute_deltas_hp(
             double delta_cx_d = mp_real_get_d(&delta_cx);
 
             size_t idx = (ly * tile_size + lx) * 2;
-            delta_buffer[idx + 0] = (float)delta_cx_d;
-            delta_buffer[idx + 1] = (float)delta_cy_d;
+            delta_buffer[idx + 0] = delta_cx_d;
+            delta_buffer[idx + 1] = delta_cy_d;
         }
     }
 
@@ -935,16 +935,16 @@ void gpu_precompute_deltas_hp(
 }
 
 void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
-                                  const float *deltas,
+                                  const double *deltas,
                                   PixelColor *output, uint32_t *iterations_out) {
     if (!perturbInitialized || !pipelinePerturbV2) {
         return;
     }
 
     // Copy deltas to GPU buffer
-    float *gpuDeltas = mtBufferContents(deltaBuffer);
+    double *gpuDeltas = mtBufferContents(deltaBuffer);
     size_t deltaCount = params->tile_size * params->tile_size * 2;
-    memcpy(gpuDeltas, deltas, deltaCount * sizeof(float));
+    memcpy(gpuDeltas, deltas, deltaCount * sizeof(double));
 
     // Set V2 parameters
     PerturbParamsV2 *perturbParams = mtBufferContents(perturbParamsV2Buffer);
@@ -1063,7 +1063,7 @@ void gpu_precompute_deltas(double center_x, double center_y, double scale,
                            double ref_cx, double ref_cy,
                            uint32_t tile_size, int vp_half_w, int vp_half_h,
                            uint32_t tile_px, uint32_t tile_py,
-                           float *delta_buffer) {
+                           double *delta_buffer) {
     (void)center_x; (void)center_y; (void)scale;
     (void)ref_cx; (void)ref_cy;
     (void)tile_size; (void)vp_half_w; (void)vp_half_h;
@@ -1072,7 +1072,7 @@ void gpu_precompute_deltas(double center_x, double center_y, double scale,
 }
 
 void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
-                                  const float *deltas,
+                                  const double *deltas,
                                   PixelColor *output, uint32_t *iterations) {
     (void)params;
     (void)deltas;
@@ -1087,7 +1087,7 @@ void gpu_precompute_deltas_hp(
     double scale,
     uint32_t tile_size, int vp_half_w, int vp_half_h,
     uint32_t tile_px, uint32_t tile_py,
-    float *delta_buffer) {
+    double *delta_buffer) {
     (void)center_x_str; (void)center_y_str;
     (void)ref_cx_str; (void)ref_cy_str;
     (void)precision; (void)scale;

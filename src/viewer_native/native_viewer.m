@@ -20,6 +20,44 @@
 #define TILE_SIZE MB_INTERACTIVE_TILE_SIZE
 #define MAX_ITER 1000
 
+// Minimap dimensions
+#define MINIMAP_WIDTH 150
+#define MINIMAP_HEIGHT 120
+#define MIN_INDICATOR_SIZE 20  // Minimum viewport indicator size in pixels
+
+// Preset locations for quick navigation
+typedef struct {
+    const char *name;
+    double center_x;
+    double center_y;
+    double zoom;
+    char key;
+} PresetLocation;
+
+static const PresetLocation kPresetLocations[] = {
+    // === Classic Locations ===
+    {"Seahorse Valley",      -0.745,              0.113,              5e3,   '1'},
+    {"Elephant Valley",       0.275,              0.006,              200,   '2'},
+    {"Double Spiral",        -0.7436438870372,    0.1318259043,       1e6,   '3'},
+    {"Mini Mandelbrot",      -1.768778833,       -0.001738996,        1e8,   '4'},
+    {"Spiral Arms",          -0.761574,          -0.0847596,          5e4,   '5'},
+
+    // === Deep Zoom Locations ===
+    {"Seahorse Tail",        -0.74364085,         0.13182733,         1e8,   '6'},
+    {"Lightning",            -1.315180982097868,  0.073481649996795,  1e10,  '7'},
+    {"Starfish",             -0.374004139,        0.659792175,        5e5,   '8'},
+    {"Dendrite",              0.2501,              0.0,                1e4,   '9'},
+
+    // === Spirals & Patterns (menu-only, no hotkey) ===
+    {"Julia Island",         -1.768,              0.0,                 200,   0},
+    {"Quad Spiral",          -0.745428,           0.113009,           5e6,   0},
+    {"Tendrils",             -0.22815,           -1.11514,            5e3,   0},
+    {"Scepter Valley",       -1.25066,            0.02012,            1e4,   0},
+    {"Period-3 Bulb",        -0.122,              0.745,              500,   0},
+    {"Period-4 Bulb",         0.282,             -0.01,               500,   0},
+};
+static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocations[0]);
+
 // =============================================================================
 // MandelbrotView - Custom NSView with Metal rendering
 // =============================================================================
@@ -65,6 +103,31 @@
     // High-precision mode tracking
     BOOL _highPrecisionMode;
     uint32_t _currentPrecision;
+
+    // Animation system
+    double _animStartCenterX, _animStartCenterY, _animStartZoom;
+    double _animTargetCenterX, _animTargetCenterY, _animTargetZoom;
+    double _animProgress;           // 0.0 to 1.0
+    double _animDuration;           // seconds (default 0.3)
+    NSDate *_animStartTime;
+
+    // Minimap
+    PixelColor *_minimapBuffer;     // Pre-rendered thumbnail (150x120)
+    PixelColor *_minimapZoomedBuffer;  // Cached zoomed minimap region
+    double _minimapCachedCenterX;      // Center X of cached zoomed view
+    double _minimapCachedCenterY;      // Center Y of cached zoomed view
+    double _minimapCachedZoomLevel;    // Minimap zoom level (1.0 = full view)
+    BOOL _showMinimap;
+
+    // Coordinate readout
+    NSPoint _mousePosition;
+    BOOL _mouseInView;
+    BOOL _showCoordinates;
+    NSTrackingArea *_trackingArea;
+
+    // Preset menu
+    BOOL _showPresetMenu;
+    int _selectedPresetIdx;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect;
@@ -167,6 +230,28 @@
         _highPrecisionMode = NO;
         _currentPrecision = 64;
 
+        // Animation system defaults
+        _animProgress = 1.0;  // Not animating
+        _animDuration = 0.3;  // 300ms default
+        _animStartTime = nil;
+
+        // Minimap setup
+        _showMinimap = YES;
+        _minimapBuffer = malloc(MINIMAP_WIDTH * MINIMAP_HEIGHT * sizeof(PixelColor));
+        _minimapZoomedBuffer = malloc(MINIMAP_WIDTH * MINIMAP_HEIGHT * sizeof(PixelColor));
+        _minimapCachedCenterX = 0.0;
+        _minimapCachedCenterY = 0.0;
+        _minimapCachedZoomLevel = 1.0;
+        if (_minimapBuffer) {
+            [self renderMinimapOnce];
+        }
+
+        // Coordinate readout setup
+        _showCoordinates = YES;
+        _mouseInView = NO;
+        _mousePosition = NSMakePoint(0, 0);
+        [self enableMouseTracking];
+
         // Set up display timer for 60fps (simpler than CVDisplayLink, avoids threading issues)
         _displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60.0
                                                          target:self
@@ -197,6 +282,19 @@
     }
     if (_parentTileBuf) {
         free(_parentTileBuf);
+    }
+    if (_minimapBuffer) {
+        free(_minimapBuffer);
+    }
+    if (_minimapZoomedBuffer) {
+        free(_minimapZoomedBuffer);
+    }
+    if (_trackingArea) {
+        [self removeTrackingArea:_trackingArea];
+        [_trackingArea release];
+    }
+    if (_animStartTime) {
+        [_animStartTime release];
     }
     scheduler_cleanup(&_scheduler);
     if (_texture) {
@@ -334,6 +432,714 @@
 }
 
 // =============================================================================
+// Animation System
+// =============================================================================
+
+- (double)easeInOutCubic:(double)t {
+    return t < 0.5 ? 4.0 * t * t * t : 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0;
+}
+
+- (void)startAnimationToX:(double)x y:(double)y zoom:(double)zoom {
+    // Store starting state
+    _animStartCenterX = _viewState.center_x;
+    _animStartCenterY = _viewState.center_y;
+    _animStartZoom = _viewState.zoom_level;
+
+    // Store target state
+    _animTargetCenterX = x;
+    _animTargetCenterY = y;
+    _animTargetZoom = zoom;
+
+    // Start animation
+    _animProgress = 0.0;
+    if (_animStartTime) {
+        [_animStartTime release];
+    }
+    _animStartTime = [[NSDate date] retain];
+    _animating = YES;
+    _needsRedraw = YES;
+}
+
+- (void)updateAnimation {
+    if (_animProgress >= 1.0 || !_animStartTime) {
+        _animating = NO;
+        return;
+    }
+
+    // Calculate elapsed time
+    NSTimeInterval elapsed = -[_animStartTime timeIntervalSinceNow];
+    _animProgress = elapsed / _animDuration;
+
+    if (_animProgress >= 1.0) {
+        // Animation complete
+        _animProgress = 1.0;
+        _viewState.center_x = _animTargetCenterX;
+        _viewState.center_y = _animTargetCenterY;
+        _viewState.zoom_level = _animTargetZoom;
+        _animating = NO;
+        [_animStartTime release];
+        _animStartTime = nil;
+    } else {
+        // Interpolate with easing
+        double t = [self easeInOutCubic:_animProgress];
+
+        _viewState.center_x = _animStartCenterX + (_animTargetCenterX - _animStartCenterX) * t;
+        _viewState.center_y = _animStartCenterY + (_animTargetCenterY - _animStartCenterY) * t;
+
+        // Logarithmic interpolation for zoom (for smooth feeling across large ranges)
+        double logStartZoom = log(_animStartZoom);
+        double logTargetZoom = log(_animTargetZoom);
+        _viewState.zoom_level = exp(logStartZoom + (logTargetZoom - logStartZoom) * t);
+    }
+
+    // Update HP mode and sync strings
+    [self updateHPMode];
+    [self syncHPCenterStrings];
+    [self invalidateCache];
+}
+
+// =============================================================================
+// Minimap
+// =============================================================================
+
+- (void)renderMinimapOnce {
+    if (!_minimapBuffer) return;
+
+    // Render full Mandelbrot set at minimap resolution
+    // Full set is roughly x: [-2.5, 1.0], y: [-1.2, 1.2]
+    double minCx = -2.5, maxCx = 1.0;
+    double minCy = -1.2, maxCy = 1.2;
+
+    double scaleX = (maxCx - minCx) / MINIMAP_WIDTH;
+    double scaleY = (maxCy - minCy) / MINIMAP_HEIGHT;
+
+    for (int y = 0; y < MINIMAP_HEIGHT; y++) {
+        double cy = maxCy - (y + 0.5) * scaleY;  // Top-down
+        for (int x = 0; x < MINIMAP_WIDTH; x++) {
+            double cx = minCx + (x + 0.5) * scaleX;
+
+            unsigned int iteration;
+            if (mb_is_in_cardioid_or_bulb(cx, cy)) {
+                iteration = 500;  // Use lower max iter for overview
+            } else {
+                double zx = 0.0, zy = 0.0;
+                double zx2 = 0.0, zy2 = 0.0;
+                iteration = 0;
+
+                while (zx2 + zy2 < 4.0 && iteration < 500) {
+                    zy = 2.0 * zx * zy + cy;
+                    zx = zx2 - zy2 + cx;
+                    zx2 = zx * zx;
+                    zy2 = zy * zy;
+                    iteration++;
+                }
+            }
+
+            color_from_iteration(&_minimapBuffer[y * MINIMAP_WIDTH + x], iteration);
+        }
+    }
+}
+
+- (void)renderMinimapZoomed:(double)zoom centerX:(double)cx centerY:(double)cy {
+    if (!_minimapZoomedBuffer) return;
+
+    // Full Mandelbrot set bounds
+    double fullMinCx = -2.5, fullMaxCx = 1.0;
+    double fullMinCy = -1.2, fullMaxCy = 1.2;
+    double fullWidth = fullMaxCx - fullMinCx;   // 3.5
+    double fullHeight = fullMaxCy - fullMinCy;  // 2.4
+
+    // Calculate zoomed region bounds
+    double zoomedWidth = fullWidth / zoom;
+    double zoomedHeight = fullHeight / zoom;
+
+    double minCx = cx - zoomedWidth / 2.0;
+    double maxCx = cx + zoomedWidth / 2.0;
+    double minCy = cy - zoomedHeight / 2.0;
+    double maxCy = cy + zoomedHeight / 2.0;
+
+    // Clamp to full Mandelbrot bounds (so we don't render outside the set)
+    if (minCx < fullMinCx) {
+        minCx = fullMinCx;
+        maxCx = minCx + zoomedWidth;
+    }
+    if (maxCx > fullMaxCx) {
+        maxCx = fullMaxCx;
+        minCx = maxCx - zoomedWidth;
+    }
+    if (minCy < fullMinCy) {
+        minCy = fullMinCy;
+        maxCy = minCy + zoomedHeight;
+    }
+    if (maxCy > fullMaxCy) {
+        maxCy = fullMaxCy;
+        minCy = maxCy - zoomedHeight;
+    }
+
+    double scaleX = (maxCx - minCx) / MINIMAP_WIDTH;
+    double scaleY = (maxCy - minCy) / MINIMAP_HEIGHT;
+
+    for (int y = 0; y < MINIMAP_HEIGHT; y++) {
+        double py = maxCy - (y + 0.5) * scaleY;  // Top-down
+        for (int x = 0; x < MINIMAP_WIDTH; x++) {
+            double px = minCx + (x + 0.5) * scaleX;
+
+            unsigned int iteration;
+            if (mb_is_in_cardioid_or_bulb(px, py)) {
+                iteration = 500;  // Use lower max iter for overview
+            } else {
+                double zx = 0.0, zy = 0.0;
+                double zx2 = 0.0, zy2 = 0.0;
+                iteration = 0;
+
+                while (zx2 + zy2 < 4.0 && iteration < 500) {
+                    zy = 2.0 * zx * zy + py;
+                    zx = zx2 - zy2 + px;
+                    zx2 = zx * zx;
+                    zy2 = zy * zy;
+                    iteration++;
+                }
+            }
+
+            color_from_iteration(&_minimapZoomedBuffer[y * MINIMAP_WIDTH + x], iteration);
+        }
+    }
+
+    // Update cache tracking
+    _minimapCachedCenterX = cx;
+    _minimapCachedCenterY = cy;
+    _minimapCachedZoomLevel = zoom;
+}
+
+- (void)drawMinimapToFramebuffer {
+    if (!_showMinimap || !_minimapBuffer) return;
+
+    int padding = 10;
+    int minimapX = padding;
+    int minimapY = _viewState.viewport_height - MINIMAP_HEIGHT - padding;
+
+    // Full Mandelbrot set bounds
+    double fullMinCx = -2.5, fullMaxCx = 1.0;
+    double fullMinCy = -1.2, fullMaxCy = 1.2;
+    double fullWidth = fullMaxCx - fullMinCx;   // 3.5
+    double fullHeight = fullMaxCy - fullMinCy;  // 2.4
+
+    // Calculate viewport size in full minimap pixels
+    double viewScale = mb_view_get_scale(&_viewState);
+    double halfW = (_viewState.viewport_width / 2.0) * viewScale;
+    double halfH = (_viewState.viewport_height / 2.0) * viewScale;
+
+    double viewMinX = _viewState.center_x - halfW;
+    double viewMaxX = _viewState.center_x + halfW;
+    double viewMinY = _viewState.center_y - halfH;
+    double viewMaxY = _viewState.center_y + halfH;
+    double viewWidth = viewMaxX - viewMinX;
+
+    // Calculate indicator size on full minimap
+    double fullMapScaleX = MINIMAP_WIDTH / fullWidth;
+    double indicatorWidth = viewWidth * fullMapScaleX;
+
+    // Determine if we need to zoom the minimap
+    double minimapZoom = 1.0;
+    BOOL useZoomedMinimap = NO;
+
+    if (indicatorWidth < MIN_INDICATOR_SIZE && _minimapZoomedBuffer) {
+        // Calculate zoom needed to make indicator visible
+        minimapZoom = MIN_INDICATOR_SIZE / indicatorWidth;
+        useZoomedMinimap = YES;
+
+        // Check if cached zoomed buffer is still valid:
+        // - Zoom level within 2x of current?
+        // - Center still within 50% of cached view bounds?
+        BOOL cacheValid = NO;
+        if (_minimapCachedZoomLevel > 0) {
+            double zoomRatio = minimapZoom / _minimapCachedZoomLevel;
+            if (zoomRatio >= 0.5 && zoomRatio <= 2.0) {
+                // Check if center is still within cached bounds
+                double cachedWidth = fullWidth / _minimapCachedZoomLevel;
+                double cachedHeight = fullHeight / _minimapCachedZoomLevel;
+                double dx = fabs(_viewState.center_x - _minimapCachedCenterX);
+                double dy = fabs(_viewState.center_y - _minimapCachedCenterY);
+                // Valid if center moved less than 25% of cached view size
+                if (dx < cachedWidth * 0.25 && dy < cachedHeight * 0.25) {
+                    cacheValid = YES;
+                }
+            }
+        }
+
+        // Re-render zoomed minimap if cache is invalid
+        if (!cacheValid) {
+            [self renderMinimapZoomed:minimapZoom centerX:_viewState.center_x centerY:_viewState.center_y];
+        }
+    }
+
+    // Select which buffer to use
+    PixelColor *sourceBuffer = useZoomedMinimap ? _minimapZoomedBuffer : _minimapBuffer;
+
+    // Draw semi-transparent border
+    int borderWidth = 2;
+    for (int y = minimapY - borderWidth; y < minimapY + MINIMAP_HEIGHT + borderWidth; y++) {
+        if (y < 0 || y >= _viewState.viewport_height) continue;
+        for (int x = minimapX - borderWidth; x < minimapX + MINIMAP_WIDTH + borderWidth; x++) {
+            if (x < 0 || x >= _viewState.viewport_width) continue;
+
+            // Check if in border region
+            BOOL inBorder = (x < minimapX || x >= minimapX + MINIMAP_WIDTH ||
+                            y < minimapY || y >= minimapY + MINIMAP_HEIGHT);
+            if (inBorder) {
+                int idx = y * _viewState.viewport_width + x;
+                _framebuffer[idx].r = 100;
+                _framebuffer[idx].g = 100;
+                _framebuffer[idx].b = 100;
+            }
+        }
+    }
+
+    // Blit minimap (using selected buffer)
+    for (int y = 0; y < MINIMAP_HEIGHT; y++) {
+        int dstY = minimapY + y;
+        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
+
+        for (int x = 0; x < MINIMAP_WIDTH; x++) {
+            int dstX = minimapX + x;
+            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
+
+            int dstIdx = dstY * _viewState.viewport_width + dstX;
+            int srcIdx = y * MINIMAP_WIDTH + x;
+            _framebuffer[dstIdx] = sourceBuffer[srcIdx];
+        }
+    }
+
+    // Calculate the bounds of what's currently shown on the minimap
+    double mapMinCx, mapMaxCx, mapMinCy, mapMaxCy;
+    if (useZoomedMinimap) {
+        // Zoomed minimap - use cached bounds
+        double zoomedWidth = fullWidth / _minimapCachedZoomLevel;
+        double zoomedHeight = fullHeight / _minimapCachedZoomLevel;
+        mapMinCx = _minimapCachedCenterX - zoomedWidth / 2.0;
+        mapMaxCx = _minimapCachedCenterX + zoomedWidth / 2.0;
+        mapMinCy = _minimapCachedCenterY - zoomedHeight / 2.0;
+        mapMaxCy = _minimapCachedCenterY + zoomedHeight / 2.0;
+
+        // Clamp to full Mandelbrot bounds (matching renderMinimapZoomed)
+        if (mapMinCx < fullMinCx) {
+            mapMinCx = fullMinCx;
+            mapMaxCx = mapMinCx + zoomedWidth;
+        }
+        if (mapMaxCx > fullMaxCx) {
+            mapMaxCx = fullMaxCx;
+            mapMinCx = mapMaxCx - zoomedWidth;
+        }
+        if (mapMinCy < fullMinCy) {
+            mapMinCy = fullMinCy;
+            mapMaxCy = mapMinCy + zoomedHeight;
+        }
+        if (mapMaxCy > fullMaxCy) {
+            mapMaxCy = fullMaxCy;
+            mapMinCy = mapMaxCy - zoomedHeight;
+        }
+    } else {
+        // Full minimap
+        mapMinCx = fullMinCx;
+        mapMaxCx = fullMaxCx;
+        mapMinCy = fullMinCy;
+        mapMaxCy = fullMaxCy;
+    }
+
+    // Draw viewport rectangle (red)
+    double mapScaleX = MINIMAP_WIDTH / (mapMaxCx - mapMinCx);
+    double mapScaleY = MINIMAP_HEIGHT / (mapMaxCy - mapMinCy);
+
+    // Convert viewport to minimap pixel coords
+    int rectX0 = minimapX + (int)((viewMinX - mapMinCx) * mapScaleX);
+    int rectX1 = minimapX + (int)((viewMaxX - mapMinCx) * mapScaleX);
+    int rectY0 = minimapY + (int)((mapMaxCy - viewMaxY) * mapScaleY);
+    int rectY1 = minimapY + (int)((mapMaxCy - viewMinY) * mapScaleY);
+
+    // Clamp to minimap bounds
+    rectX0 = MAX(minimapX, MIN(minimapX + MINIMAP_WIDTH - 1, rectX0));
+    rectX1 = MAX(minimapX, MIN(minimapX + MINIMAP_WIDTH - 1, rectX1));
+    rectY0 = MAX(minimapY, MIN(minimapY + MINIMAP_HEIGHT - 1, rectY0));
+    rectY1 = MAX(minimapY, MIN(minimapY + MINIMAP_HEIGHT - 1, rectY1));
+
+    // Ensure minimum indicator size (at least 2 pixels if within bounds)
+    if (rectX1 - rectX0 < 2 && rectX0 >= minimapX && rectX1 <= minimapX + MINIMAP_WIDTH - 2) {
+        rectX1 = rectX0 + 2;
+    }
+    if (rectY1 - rectY0 < 2 && rectY0 >= minimapY && rectY1 <= minimapY + MINIMAP_HEIGHT - 2) {
+        rectY1 = rectY0 + 2;
+    }
+
+    // Draw rectangle outline (red)
+    PixelColor red = {255, 0, 0};
+
+    // Top edge
+    for (int x = rectX0; x <= rectX1; x++) {
+        if (rectY0 >= 0 && rectY0 < _viewState.viewport_height && x >= 0 && x < _viewState.viewport_width) {
+            _framebuffer[rectY0 * _viewState.viewport_width + x] = red;
+        }
+    }
+    // Bottom edge
+    for (int x = rectX0; x <= rectX1; x++) {
+        if (rectY1 >= 0 && rectY1 < _viewState.viewport_height && x >= 0 && x < _viewState.viewport_width) {
+            _framebuffer[rectY1 * _viewState.viewport_width + x] = red;
+        }
+    }
+    // Left edge
+    for (int y = rectY0; y <= rectY1; y++) {
+        if (y >= 0 && y < _viewState.viewport_height && rectX0 >= 0 && rectX0 < _viewState.viewport_width) {
+            _framebuffer[y * _viewState.viewport_width + rectX0] = red;
+        }
+    }
+    // Right edge
+    for (int y = rectY0; y <= rectY1; y++) {
+        if (y >= 0 && y < _viewState.viewport_height && rectX1 >= 0 && rectX1 < _viewState.viewport_width) {
+            _framebuffer[y * _viewState.viewport_width + rectX1] = red;
+        }
+    }
+}
+
+// =============================================================================
+// Mouse Tracking & Coordinate Readout
+// =============================================================================
+
+- (void)enableMouseTracking {
+    _trackingArea = [[NSTrackingArea alloc] initWithRect:self.bounds
+                                                 options:(NSTrackingMouseMoved |
+                                                         NSTrackingMouseEnteredAndExited |
+                                                         NSTrackingActiveInKeyWindow |
+                                                         NSTrackingInVisibleRect)
+                                                   owner:self
+                                                userInfo:nil];
+    [self addTrackingArea:_trackingArea];
+}
+
+- (void)mouseMoved:(NSEvent *)event {
+    NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
+    loc.y = self.bounds.size.height - loc.y;  // Flip Y
+    _mousePosition = loc;
+    _needsRedraw = YES;
+}
+
+- (void)mouseEntered:(NSEvent *)event {
+    _mouseInView = YES;
+    _needsRedraw = YES;
+}
+
+- (void)mouseExited:(NSEvent *)event {
+    _mouseInView = NO;
+    _needsRedraw = YES;
+}
+
+- (void)drawCoordinateReadout {
+    if (!_showCoordinates || !_mouseInView) return;
+
+    // Calculate complex coordinates at mouse position
+    double scale = mb_view_get_scale(&_viewState);
+    double cx = _viewState.center_x + (_mousePosition.x - _viewState.viewport_width / 2.0) * scale;
+    double cy = _viewState.center_y - (_mousePosition.y - _viewState.viewport_height / 2.0) * scale;
+
+    // Format coordinate string
+    NSString *coordStr;
+    if (cy >= 0) {
+        coordStr = [NSString stringWithFormat:@"%.10f + %.10fi", cx, cy];
+    } else {
+        coordStr = [NSString stringWithFormat:@"%.10f - %.10fi", cx, -cy];
+    }
+
+    // Calculate position for text (offset from cursor)
+    int textX = (int)_mousePosition.x + 15;
+    int textY = (int)_mousePosition.y - 10;
+
+    // Keep on screen
+    int textWidth = 280;
+    int textHeight = 20;
+    if (textX + textWidth > _viewState.viewport_width) {
+        textX = (int)_mousePosition.x - textWidth - 10;
+    }
+    if (textY < 0) {
+        textY = (int)_mousePosition.y + 20;
+    }
+    if (textY + textHeight > _viewState.viewport_height) {
+        textY = _viewState.viewport_height - textHeight - 5;
+    }
+
+    // Draw semi-transparent background
+    int padding = 4;
+    for (int y = textY - padding; y < textY + textHeight + padding && y < _viewState.viewport_height; y++) {
+        if (y < 0) continue;
+        for (int x = textX - padding; x < textX + textWidth + padding && x < _viewState.viewport_width; x++) {
+            if (x < 0) continue;
+            int idx = y * _viewState.viewport_width + x;
+            _framebuffer[idx].r = _framebuffer[idx].r / 2;
+            _framebuffer[idx].g = _framebuffer[idx].g / 2;
+            _framebuffer[idx].b = _framebuffer[idx].b / 2;
+        }
+    }
+
+    // Render text using Core Graphics
+    uint8_t *textBitmap = calloc(textWidth * textHeight * 4, 1);
+    if (!textBitmap) return;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(textBitmap, textWidth, textHeight, 8,
+                                              textWidth * 4, colorSpace,
+                                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) {
+        free(textBitmap);
+        return;
+    }
+
+    NSFont *font = [NSFont fontWithName:@"Menlo" size:11.0];
+    if (!font) font = [NSFont monospacedSystemFontOfSize:11.0 weight:NSFontWeightRegular];
+    NSColor *textColor = [NSColor colorWithRed:0.0 green:1.0 blue:0.8 alpha:1.0];  // Cyan-ish
+
+    NSDictionary *attributes = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: textColor
+    };
+
+    NSAttributedString *attrStr = [[NSAttributedString alloc] initWithString:coordStr attributes:attributes];
+    NSGraphicsContext *nsContext = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:nsContext];
+    [attrStr drawInRect:NSMakeRect(0, 0, textWidth, textHeight)];
+    [NSGraphicsContext restoreGraphicsState];
+
+    // Blit text to framebuffer
+    for (int ty = 0; ty < textHeight; ty++) {
+        int srcY = textHeight - 1 - ty;
+        int dstY = textY + ty;
+        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
+
+        for (int tx = 0; tx < textWidth; tx++) {
+            int dstX = textX + tx;
+            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
+
+            int srcIdx = srcY * textWidth + tx;
+            int dstIdx = dstY * _viewState.viewport_width + dstX;
+
+            uint8_t sr = textBitmap[srcIdx * 4 + 0];
+            uint8_t sg = textBitmap[srcIdx * 4 + 1];
+            uint8_t sb = textBitmap[srcIdx * 4 + 2];
+            uint8_t sa = textBitmap[srcIdx * 4 + 3];
+
+            if (sa > 0) {
+                float alpha = sa / 255.0f;
+                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
+                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
+                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
+            }
+        }
+    }
+
+    [attrStr release];
+    CGContextRelease(ctx);
+    free(textBitmap);
+}
+
+- (void)drawPresetMenuToFramebuffer {
+    if (!_showPresetMenu) return;
+
+    // Menu dimensions
+    int menuWidth = 420;
+    int lineHeight = 20;
+    int padding = 15;
+    int menuHeight = (kPresetCount + 3) * lineHeight + padding * 2;  // +3 for title, blank, and help
+
+    // Center on screen
+    int menuX = (_viewState.viewport_width - menuWidth) / 2;
+    int menuY = (_viewState.viewport_height - menuHeight) / 2;
+
+    // Clamp to screen bounds
+    if (menuX < 10) menuX = 10;
+    if (menuY < 10) menuY = 10;
+    if (menuX + menuWidth > _viewState.viewport_width - 10) {
+        menuX = _viewState.viewport_width - menuWidth - 10;
+    }
+    if (menuY + menuHeight > _viewState.viewport_height - 10) {
+        menuY = _viewState.viewport_height - menuHeight - 10;
+    }
+
+    // 1. Draw semi-transparent background (70% opacity black)
+    for (int y = menuY; y < menuY + menuHeight && y < _viewState.viewport_height; y++) {
+        if (y < 0) continue;
+        for (int x = menuX; x < menuX + menuWidth && x < _viewState.viewport_width; x++) {
+            if (x < 0) continue;
+            int idx = y * _viewState.viewport_width + x;
+            _framebuffer[idx].r = (uint8_t)(_framebuffer[idx].r * 0.3);
+            _framebuffer[idx].g = (uint8_t)(_framebuffer[idx].g * 0.3);
+            _framebuffer[idx].b = (uint8_t)(_framebuffer[idx].b * 0.3);
+        }
+    }
+
+    // Draw border
+    for (int y = menuY; y < menuY + menuHeight && y < _viewState.viewport_height; y++) {
+        if (y < 0) continue;
+        // Left border
+        if (menuX >= 0 && menuX < _viewState.viewport_width) {
+            int idx = y * _viewState.viewport_width + menuX;
+            _framebuffer[idx].r = 100; _framebuffer[idx].g = 100; _framebuffer[idx].b = 100;
+        }
+        // Right border
+        int rx = menuX + menuWidth - 1;
+        if (rx >= 0 && rx < _viewState.viewport_width) {
+            int idx = y * _viewState.viewport_width + rx;
+            _framebuffer[idx].r = 100; _framebuffer[idx].g = 100; _framebuffer[idx].b = 100;
+        }
+    }
+    for (int x = menuX; x < menuX + menuWidth && x < _viewState.viewport_width; x++) {
+        if (x < 0) continue;
+        // Top border
+        if (menuY >= 0 && menuY < _viewState.viewport_height) {
+            int idx = menuY * _viewState.viewport_width + x;
+            _framebuffer[idx].r = 100; _framebuffer[idx].g = 100; _framebuffer[idx].b = 100;
+        }
+        // Bottom border
+        int by = menuY + menuHeight - 1;
+        if (by >= 0 && by < _viewState.viewport_height) {
+            int idx = by * _viewState.viewport_width + x;
+            _framebuffer[idx].r = 100; _framebuffer[idx].g = 100; _framebuffer[idx].b = 100;
+        }
+    }
+
+    // 2. Build menu text
+    NSMutableString *menuText = [NSMutableString string];
+    [menuText appendString:@"══════════ PRESETS ══════════\n\n"];
+
+    for (int i = 0; i < kPresetCount; i++) {
+        char keyStr[4] = "   ";
+        if (kPresetLocations[i].key != 0) {
+            keyStr[0] = '[';
+            keyStr[1] = kPresetLocations[i].key;
+            keyStr[2] = ']';
+        }
+
+        NSString *marker = (i == _selectedPresetIdx) ? @"> " : @"  ";
+        [menuText appendFormat:@"%@%s %-18s  (%.1e)\n",
+            marker, keyStr, kPresetLocations[i].name,
+            kPresetLocations[i].zoom];
+    }
+
+    [menuText appendString:@"\n  Up/Down Navigate  Enter Select  P/Esc Close"];
+
+    // 3. Render text using Core Graphics
+    int textWidth = menuWidth - padding * 2;
+    int textHeight = menuHeight - padding;
+    uint8_t *textBitmap = calloc(textWidth * textHeight * 4, 1);
+    if (!textBitmap) return;
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(textBitmap, textWidth, textHeight, 8,
+                                              textWidth * 4, colorSpace,
+                                              (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) {
+        free(textBitmap);
+        return;
+    }
+
+    NSFont *font = [NSFont fontWithName:@"Menlo" size:12.0];
+    if (!font) font = [NSFont monospacedSystemFontOfSize:12.0 weight:NSFontWeightRegular];
+
+    // Create attributed string with different colors for selected item
+    NSMutableAttributedString *attrStr = [[NSMutableAttributedString alloc] init];
+
+    // Title
+    NSDictionary *titleAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithRed:0.3 green:0.8 blue:1.0 alpha:1.0]
+    };
+    [attrStr appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@"══════════ PRESETS ══════════\n\n" attributes:titleAttrs]];
+
+    // Preset items
+    NSDictionary *normalAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithRed:0.8 green:0.8 blue:0.8 alpha:1.0]
+    };
+    NSDictionary *selectedAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithRed:1.0 green:1.0 blue:0.2 alpha:1.0]
+    };
+    NSDictionary *hotkeyAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithRed:0.5 green:0.8 blue:0.5 alpha:1.0]
+    };
+
+    for (int i = 0; i < kPresetCount; i++) {
+        NSDictionary *lineAttrs = (i == _selectedPresetIdx) ? selectedAttrs : normalAttrs;
+        NSString *marker = (i == _selectedPresetIdx) ? @"> " : @"  ";
+
+        [attrStr appendAttributedString:[[NSAttributedString alloc]
+            initWithString:marker attributes:lineAttrs]];
+
+        if (kPresetLocations[i].key != 0) {
+            NSString *keyStr = [NSString stringWithFormat:@"[%c] ", kPresetLocations[i].key];
+            [attrStr appendAttributedString:[[NSAttributedString alloc]
+                initWithString:keyStr attributes:hotkeyAttrs]];
+        } else {
+            [attrStr appendAttributedString:[[NSAttributedString alloc]
+                initWithString:@"    " attributes:lineAttrs]];
+        }
+
+        NSString *nameAndZoom = [NSString stringWithFormat:@"%-18s  (%.1e)\n",
+            kPresetLocations[i].name, kPresetLocations[i].zoom];
+        [attrStr appendAttributedString:[[NSAttributedString alloc]
+            initWithString:nameAndZoom attributes:lineAttrs]];
+    }
+
+    // Help line
+    NSDictionary *helpAttrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithRed:0.6 green:0.6 blue:0.6 alpha:1.0]
+    };
+    [attrStr appendAttributedString:[[NSAttributedString alloc]
+        initWithString:@"\n  Up/Down Navigate  Enter Select  P/Esc Close" attributes:helpAttrs]];
+
+    NSGraphicsContext *nsContext = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+    [NSGraphicsContext saveGraphicsState];
+    [NSGraphicsContext setCurrentContext:nsContext];
+    [attrStr drawInRect:NSMakeRect(0, 0, textWidth, textHeight)];
+    [NSGraphicsContext restoreGraphicsState];
+
+    // Blit text to framebuffer
+    int textStartX = menuX + padding;
+    int textStartY = menuY + padding / 2;
+
+    for (int ty = 0; ty < textHeight; ty++) {
+        int srcY = textHeight - 1 - ty;
+        int dstY = textStartY + ty;
+        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
+
+        for (int tx = 0; tx < textWidth; tx++) {
+            int dstX = textStartX + tx;
+            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
+
+            int srcIdx = srcY * textWidth + tx;
+            int dstIdx = dstY * _viewState.viewport_width + dstX;
+
+            uint8_t sr = textBitmap[srcIdx * 4 + 0];
+            uint8_t sg = textBitmap[srcIdx * 4 + 1];
+            uint8_t sb = textBitmap[srcIdx * 4 + 2];
+            uint8_t sa = textBitmap[srcIdx * 4 + 3];
+
+            if (sa > 0) {
+                float alpha = sa / 255.0f;
+                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
+                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
+                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
+            }
+        }
+    }
+
+    [attrStr release];
+    CGContextRelease(ctx);
+    free(textBitmap);
+}
+
+// =============================================================================
 // Zoom towards point math
 // =============================================================================
 
@@ -346,9 +1152,8 @@
     // Apply zoom
     _viewState.zoom_level *= delta;
 
-    // Clamp zoom level (extended max for HP mode)
+    // Clamp zoom level (no upper limit - MPFR handles arbitrary precision)
     if (_viewState.zoom_level < 0.1) _viewState.zoom_level = 0.1;
-    if (_viewState.zoom_level > 1e100) _viewState.zoom_level = 1e100;
 
     // Recalculate center so mouse point stays fixed
     double new_scale = mb_view_get_scale(&_viewState);
@@ -436,16 +1241,49 @@
     }
     unichar key = [chars characterAtIndex:0];
 
+    // Handle preset menu navigation when menu is open
+    if (_showPresetMenu) {
+        switch (key) {
+            case NSUpArrowFunctionKey:
+                _selectedPresetIdx--;
+                if (_selectedPresetIdx < 0) _selectedPresetIdx = kPresetCount - 1;
+                _needsRedraw = YES;
+                return;
+            case NSDownArrowFunctionKey:
+                _selectedPresetIdx++;
+                if (_selectedPresetIdx >= kPresetCount) _selectedPresetIdx = 0;
+                _needsRedraw = YES;
+                return;
+            case 13: // Enter/Return
+                // Navigate to selected preset
+                [self startAnimationToX:kPresetLocations[_selectedPresetIdx].center_x
+                                      y:kPresetLocations[_selectedPresetIdx].center_y
+                                   zoom:kPresetLocations[_selectedPresetIdx].zoom];
+                _showPresetMenu = NO;
+                _needsRedraw = YES;
+                return;
+            case 27: // Escape
+                _showPresetMenu = NO;
+                _needsRedraw = YES;
+                return;
+            case 'p':
+            case 'P':
+                _showPresetMenu = NO;
+                _needsRedraw = YES;
+                return;
+        }
+        // Allow other keys to close menu and perform action
+    }
+
     double panAmount = 50.0 * mb_view_get_scale(&_viewState);
 
     switch (key) {
         case 'r':
         case 'R':
-            // Reset view
-            mb_view_state_init(&_viewState, _viewState.viewport_width, _viewState.viewport_height);
+            // Reset view with animation
+            [self startAnimationToX:-0.5 y:0.0 zoom:1.0];
             _highPrecisionMode = NO;
             _currentPrecision = 64;
-            [self invalidateCache];
             return;
         case '=':
         case '+':
@@ -481,11 +1319,46 @@
         case 27: // Escape
             [self.window close];
             return;
+        case 'p':
+        case 'P':
+            _showPresetMenu = !_showPresetMenu;
+            _needsRedraw = YES;
+            return;
         case 'i':
         case 'I':
             _showHUD = !_showHUD;
             _needsRedraw = YES;
             return;
+        case 'm':
+        case 'M':
+            _showMinimap = !_showMinimap;
+            _needsRedraw = YES;
+            return;
+        case 'c':
+        case 'C':
+            _showCoordinates = !_showCoordinates;
+            _needsRedraw = YES;
+            return;
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9': {
+            // Navigate to preset location (if key matches a preset's hotkey)
+            for (int i = 0; i < kPresetCount; i++) {
+                if (kPresetLocations[i].key == key) {
+                    [self startAnimationToX:kPresetLocations[i].center_x
+                                          y:kPresetLocations[i].center_y
+                                       zoom:kPresetLocations[i].zoom];
+                    break;
+                }
+            }
+            return;
+        }
         default:
             [super keyDown:event];
             return;
@@ -511,6 +1384,12 @@
 
 - (void)displayTimerFired:(NSTimer *)timer {
     (void)timer;
+
+    // Update animation state
+    if (_animating) {
+        [self updateAnimation];
+    }
+
     if (_needsRedraw) {
         [self renderFrame];
         _needsRedraw = NO;
@@ -889,7 +1768,18 @@
         [self drawHUDToFramebuffer];
     }
 
-    // 8. Upload and present
+    // 8. Draw minimap
+    [self drawMinimapToFramebuffer];
+
+    // 9. Draw coordinate readout
+    [self drawCoordinateReadout];
+
+    // 10. Draw preset menu (if visible)
+    if (_showPresetMenu) {
+        [self drawPresetMenuToFramebuffer];
+    }
+
+    // 11. Upload and present
     [self uploadAndPresent];
 }
 
@@ -929,7 +1819,7 @@
 
     NSString *tilesLine = [NSString stringWithFormat:@"Tiles: %lu cached, %lu pending",
                           (unsigned long)cachedCount, (unsigned long)pendingCount];
-    NSString *helpLine = @"Press 'I' to toggle HUD";
+    NSString *helpLine = @"Keys: I=HUD M=map C=coords P=presets 1-9=goto R=reset";
 
     NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@\n%@",
                         zoomLine, centerLine, scaleLine, precLine, tilesLine, helpLine];
@@ -937,8 +1827,8 @@
     // HUD dimensions
     int padding = 10;
     int lineHeight = 16;
-    int hudWidth = 280;
-    int hudHeight = lineHeight * 6 + padding * 2;  // 6 lines now with precision
+    int hudWidth = 340;  // Wider for longer help line
+    int hudHeight = lineHeight * 6 + padding * 2;  // 6 lines
 
     // Position in top-right corner
     int hudX = _viewState.viewport_width - hudWidth - padding;
