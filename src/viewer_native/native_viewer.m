@@ -11,7 +11,30 @@
 #include <stdlib.h>
 #include <math.h>
 
-#define CACHE_PATH "~/.mandelbrot/tiles"
+// =============================================================================
+// Debug Logging (disabled in release builds)
+// =============================================================================
+
+#ifdef DEBUG
+#define MB_DEBUG_LOG(fmt, ...) NSLog(fmt, ##__VA_ARGS__)
+#else
+#define MB_DEBUG_LOG(fmt, ...) ((void)0)
+#endif
+
+// Default cache paths
+#define MB_CACHE_ENV_VAR "MB_CACHE_DIR"
+#define MB_CACHE_DEFAULT_MACOS "~/Library/Caches/Mandelbrot/tiles"
+#define MB_CACHE_FALLBACK "~/.mandelbrot/tiles"
+
+// Get cache path from environment or default
+static NSString* getCachePath(void) {
+    const char *envPath = getenv(MB_CACHE_ENV_VAR);
+    if (envPath && envPath[0] != '\0') {
+        return [NSString stringWithUTF8String:envPath];
+    }
+    // macOS standard cache location
+    return [@MB_CACHE_DEFAULT_MACOS stringByExpandingTildeInPath];
+}
 
 // =============================================================================
 // Constants
@@ -20,10 +43,26 @@
 #define TILE_SIZE MB_INTERACTIVE_TILE_SIZE
 #define MAX_ITER 1000
 
-// Minimap dimensions
+// Minimap dimensions and settings
 #define MINIMAP_WIDTH 150
 #define MINIMAP_HEIGHT 120
-#define MIN_INDICATOR_SIZE 20  // Minimum viewport indicator size in pixels
+#define MIN_INDICATOR_SIZE 20       // Minimum viewport indicator size in pixels
+#define MINIMAP_MAX_ITER 500        // Lower iteration limit for minimap (performance)
+
+// Mandelbrot set bounds (standard view encompasses the full set)
+#define MB_FULL_MIN_CX (-2.5)
+#define MB_FULL_MAX_CX (1.0)
+#define MB_FULL_MIN_CY (-1.2)
+#define MB_FULL_MAX_CY (1.2)
+#define MB_FULL_WIDTH (MB_FULL_MAX_CX - MB_FULL_MIN_CX)   // 3.5
+#define MB_FULL_HEIGHT (MB_FULL_MAX_CY - MB_FULL_MIN_CY)  // 2.4
+
+// Zoom factors
+#define MB_ZOOM_IN_FACTOR 1.5
+#define MB_ZOOM_OUT_FACTOR 0.67
+
+// Scroll sensitivity
+#define MB_SCROLL_SENSITIVITY 0.05
 
 // Preset locations for quick navigation
 typedef struct {
@@ -33,6 +72,56 @@ typedef struct {
     double zoom;
     char key;
 } PresetLocation;
+
+// =============================================================================
+// Key Handler Dispatch Table
+// =============================================================================
+
+// Forward declaration for MandelbrotView
+@class MandelbrotView;
+
+// Key handler function type
+typedef void (*KeyHandlerFunc)(MandelbrotView *self);
+
+// Key binding entry
+typedef struct {
+    unichar key;
+    unichar altKey;           // Secondary key (e.g., 'R' for 'r'), 0 if none
+    KeyHandlerFunc handler;
+    BOOL closesPresetMenu;    // If YES, also closes preset menu when triggered
+} KeyBinding;
+
+// Handler function declarations
+static void handleResetView(MandelbrotView *self);
+static void handleZoomIn(MandelbrotView *self);
+static void handleZoomOut(MandelbrotView *self);
+static void handleToggleHUD(MandelbrotView *self);
+static void handleToggleMinimap(MandelbrotView *self);
+static void handleToggleCoordinates(MandelbrotView *self);
+static void handleTogglePresetMenu(MandelbrotView *self);
+static void handleEscape(MandelbrotView *self);
+static void handlePanUp(MandelbrotView *self);
+static void handlePanDown(MandelbrotView *self);
+static void handlePanLeft(MandelbrotView *self);
+static void handlePanRight(MandelbrotView *self);
+static void handlePresetKey(MandelbrotView *self, unichar key);
+
+// Static key bindings table (non-preset keys)
+static const KeyBinding kKeyBindings[] = {
+    { 'r', 'R', handleResetView,          YES },
+    { '=', '+', handleZoomIn,             YES },
+    { '-', 0,   handleZoomOut,            YES },
+    { 'i', 'I', handleToggleHUD,          NO  },
+    { 'm', 'M', handleToggleMinimap,      NO  },
+    { 'c', 'C', handleToggleCoordinates,  NO  },
+    { 'p', 'P', handleTogglePresetMenu,   NO  },
+    { 27,  0,   handleEscape,             NO  },  // Escape key
+};
+static const int kKeyBindingsCount = sizeof(kKeyBindings) / sizeof(kKeyBindings[0]);
+
+// =============================================================================
+// Preset Locations
+// =============================================================================
 
 static const PresetLocation kPresetLocations[] = {
     // === Classic Locations ===
@@ -139,7 +228,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 @implementation MandelbrotView
 
 - (instancetype)initWithFrame:(NSRect)frameRect {
-    NSLog(@"MandelbrotView initWithFrame: starting, size=%fx%f", frameRect.size.width, frameRect.size.height);
+    MB_DEBUG_LOG(@"MandelbrotView initWithFrame: starting, size=%fx%f", frameRect.size.width, frameRect.size.height);
     self = [super initWithFrame:frameRect];
     if (self) {
         // Initialize view state FIRST (needed for makeBackingLayer)
@@ -148,10 +237,10 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         // Initialize Metal (before wantsLayer triggers makeBackingLayer)
         _device = MTLCreateSystemDefaultDevice();
         if (!_device) {
-            NSLog(@"Metal is not supported on this device");
+            MB_DEBUG_LOG(@"Metal is not supported on this device");
             return nil;
         }
-        NSLog(@"MandelbrotView: got Metal device: %@", _device.name);
+        MB_DEBUG_LOG(@"MandelbrotView: got Metal device: %@", _device.name);
         _commandQueue = [_device newCommandQueue];
 
         // Now enable layer-backing (this calls makeBackingLayer)
@@ -161,32 +250,32 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         if (_metalLayer) {
             _metalLayer.device = _device;
             _metalLayer.drawableSize = CGSizeMake(frameRect.size.width, frameRect.size.height);
-            NSLog(@"MandelbrotView: Metal layer configured with size %fx%f", frameRect.size.width, frameRect.size.height);
+            MB_DEBUG_LOG(@"MandelbrotView: Metal layer configured with size %fx%f", frameRect.size.width, frameRect.size.height);
         } else {
-            NSLog(@"MandelbrotView: WARNING - no metal layer after wantsLayer=YES");
+            MB_DEBUG_LOG(@"MandelbrotView: WARNING - no metal layer after wantsLayer=YES");
         }
 
         // Initialize scheduler
-        NSLog(@"MandelbrotView: initializing scheduler");
+        MB_DEBUG_LOG(@"MandelbrotView: initializing scheduler");
         if (scheduler_init(&_scheduler, TILE_SIZE, MAX_ITER) != 0) {
-            NSLog(@"Failed to initialize compute scheduler");
+            MB_DEBUG_LOG(@"Failed to initialize compute scheduler");
             return nil;
         }
-        NSLog(@"MandelbrotView: scheduler initialized");
+        MB_DEBUG_LOG(@"MandelbrotView: scheduler initialized");
 
-        // Initialize disk cache
-        NSString *cachePath = [@CACHE_PATH stringByExpandingTildeInPath];
+        // Initialize disk cache (check MB_CACHE_DIR env var first)
+        NSString *cachePath = getCachePath();
         if (scheduler_init_disk_cache(&_scheduler, [cachePath UTF8String], 0) != 0) {
-            NSLog(@"Warning: Failed to initialize disk cache, tiles won't persist");
+            MB_DEBUG_LOG(@"Warning: Failed to initialize disk cache, tiles won't persist");
         } else {
-            NSLog(@"MandelbrotView: disk cache initialized at %@", cachePath);
+            MB_DEBUG_LOG(@"MandelbrotView: disk cache initialized at %@", cachePath);
         }
 
         // Allocate map tile buffers (256x256)
         _mapTileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
         _scaledTileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
         if (!_mapTileBuf || !_scaledTileBuf) {
-            NSLog(@"Failed to allocate map tile buffers");
+            MB_DEBUG_LOG(@"Failed to allocate map tile buffers");
             if (_mapTileBuf) free(_mapTileBuf);
             if (_scaledTileBuf) free(_scaledTileBuf);
             scheduler_cleanup(&_scheduler);
@@ -215,7 +304,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         // Parent tile fallback buffer
         _parentTileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
         if (!_parentTileBuf) {
-            NSLog(@"Failed to allocate parent tile buffer");
+            MB_DEBUG_LOG(@"Failed to allocate parent tile buffer");
             free(_mapTileBuf);
             free(_scaledTileBuf);
             free(_framebuffer);
@@ -350,11 +439,14 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         _metalLayer.drawableSize = CGSizeMake(newSize.width, newSize.height);
     }
 
-    // Resize framebuffer
+    // Resize framebuffer (keep old buffer if realloc fails)
     size_t pixels = (size_t)_viewState.viewport_width * _viewState.viewport_height;
     PixelColor *newBuf = realloc(_framebuffer, pixels * sizeof(PixelColor));
     if (newBuf) {
         _framebuffer = newBuf;
+    } else {
+        // Realloc failed - keep old buffer and restore dimensions
+        return;
     }
 
     // Resize texture
@@ -370,6 +462,11 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     if (_texture) {
         [_texture release];
         _texture = nil;
+    }
+
+    // Safety check for Metal device
+    if (!_device) {
+        return;
     }
 
     MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
@@ -499,6 +596,43 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 }
 
 // =============================================================================
+// Text Blitting Helper
+// =============================================================================
+
+- (void)blitTextBitmap:(uint8_t *)bitmap
+                 width:(int)bmpWidth
+                height:(int)bmpHeight
+                   toX:(int)dstX
+                     y:(int)dstY
+{
+    for (int ty = 0; ty < bmpHeight; ty++) {
+        int srcY = bmpHeight - 1 - ty;  // Flip Y for CG coordinates
+        int screenY = dstY + ty;
+        if (screenY < 0 || screenY >= _viewState.viewport_height) continue;
+
+        for (int tx = 0; tx < bmpWidth; tx++) {
+            int screenX = dstX + tx;
+            if (screenX < 0 || screenX >= _viewState.viewport_width) continue;
+
+            int srcIdx = srcY * bmpWidth + tx;
+            int dstIdx = screenY * _viewState.viewport_width + screenX;
+
+            uint8_t sr = bitmap[srcIdx * 4 + 0];
+            uint8_t sg = bitmap[srcIdx * 4 + 1];
+            uint8_t sb = bitmap[srcIdx * 4 + 2];
+            uint8_t sa = bitmap[srcIdx * 4 + 3];
+
+            if (sa > 0) {
+                float alpha = sa / 255.0f;
+                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
+                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
+                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Minimap
 // =============================================================================
 
@@ -506,35 +640,14 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     if (!_minimapBuffer) return;
 
     // Render full Mandelbrot set at minimap resolution
-    // Full set is roughly x: [-2.5, 1.0], y: [-1.2, 1.2]
-    double minCx = -2.5, maxCx = 1.0;
-    double minCy = -1.2, maxCy = 1.2;
-
-    double scaleX = (maxCx - minCx) / MINIMAP_WIDTH;
-    double scaleY = (maxCy - minCy) / MINIMAP_HEIGHT;
+    double scaleX = MB_FULL_WIDTH / MINIMAP_WIDTH;
+    double scaleY = MB_FULL_HEIGHT / MINIMAP_HEIGHT;
 
     for (int y = 0; y < MINIMAP_HEIGHT; y++) {
-        double cy = maxCy - (y + 0.5) * scaleY;  // Top-down
+        double cy = MB_FULL_MAX_CY - (y + 0.5) * scaleY;  // Top-down
         for (int x = 0; x < MINIMAP_WIDTH; x++) {
-            double cx = minCx + (x + 0.5) * scaleX;
-
-            unsigned int iteration;
-            if (mb_is_in_cardioid_or_bulb(cx, cy)) {
-                iteration = 500;  // Use lower max iter for overview
-            } else {
-                double zx = 0.0, zy = 0.0;
-                double zx2 = 0.0, zy2 = 0.0;
-                iteration = 0;
-
-                while (zx2 + zy2 < 4.0 && iteration < 500) {
-                    zy = 2.0 * zx * zy + cy;
-                    zx = zx2 - zy2 + cx;
-                    zx2 = zx * zx;
-                    zy2 = zy * zy;
-                    iteration++;
-                }
-            }
-
+            double cx = MB_FULL_MIN_CX + (x + 0.5) * scaleX;
+            unsigned int iteration = mb_compute_point(cx, cy, MINIMAP_MAX_ITER);
             color_from_iteration(&_minimapBuffer[y * MINIMAP_WIDTH + x], iteration);
         }
     }
@@ -543,15 +656,9 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 - (void)renderMinimapZoomed:(double)zoom centerX:(double)cx centerY:(double)cy {
     if (!_minimapZoomedBuffer) return;
 
-    // Full Mandelbrot set bounds
-    double fullMinCx = -2.5, fullMaxCx = 1.0;
-    double fullMinCy = -1.2, fullMaxCy = 1.2;
-    double fullWidth = fullMaxCx - fullMinCx;   // 3.5
-    double fullHeight = fullMaxCy - fullMinCy;  // 2.4
-
     // Calculate zoomed region bounds
-    double zoomedWidth = fullWidth / zoom;
-    double zoomedHeight = fullHeight / zoom;
+    double zoomedWidth = MB_FULL_WIDTH / zoom;
+    double zoomedHeight = MB_FULL_HEIGHT / zoom;
 
     double minCx = cx - zoomedWidth / 2.0;
     double maxCx = cx + zoomedWidth / 2.0;
@@ -559,20 +666,20 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     double maxCy = cy + zoomedHeight / 2.0;
 
     // Clamp to full Mandelbrot bounds (so we don't render outside the set)
-    if (minCx < fullMinCx) {
-        minCx = fullMinCx;
+    if (minCx < MB_FULL_MIN_CX) {
+        minCx = MB_FULL_MIN_CX;
         maxCx = minCx + zoomedWidth;
     }
-    if (maxCx > fullMaxCx) {
-        maxCx = fullMaxCx;
+    if (maxCx > MB_FULL_MAX_CX) {
+        maxCx = MB_FULL_MAX_CX;
         minCx = maxCx - zoomedWidth;
     }
-    if (minCy < fullMinCy) {
-        minCy = fullMinCy;
+    if (minCy < MB_FULL_MIN_CY) {
+        minCy = MB_FULL_MIN_CY;
         maxCy = minCy + zoomedHeight;
     }
-    if (maxCy > fullMaxCy) {
-        maxCy = fullMaxCy;
+    if (maxCy > MB_FULL_MAX_CY) {
+        maxCy = MB_FULL_MAX_CY;
         minCy = maxCy - zoomedHeight;
     }
 
@@ -583,24 +690,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         double py = maxCy - (y + 0.5) * scaleY;  // Top-down
         for (int x = 0; x < MINIMAP_WIDTH; x++) {
             double px = minCx + (x + 0.5) * scaleX;
-
-            unsigned int iteration;
-            if (mb_is_in_cardioid_or_bulb(px, py)) {
-                iteration = 500;  // Use lower max iter for overview
-            } else {
-                double zx = 0.0, zy = 0.0;
-                double zx2 = 0.0, zy2 = 0.0;
-                iteration = 0;
-
-                while (zx2 + zy2 < 4.0 && iteration < 500) {
-                    zy = 2.0 * zx * zy + py;
-                    zx = zx2 - zy2 + px;
-                    zx2 = zx * zx;
-                    zy2 = zy * zy;
-                    iteration++;
-                }
-            }
-
+            unsigned int iteration = mb_compute_point(px, py, MINIMAP_MAX_ITER);
             color_from_iteration(&_minimapZoomedBuffer[y * MINIMAP_WIDTH + x], iteration);
         }
     }
@@ -618,12 +708,6 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     int minimapX = padding;
     int minimapY = _viewState.viewport_height - MINIMAP_HEIGHT - padding;
 
-    // Full Mandelbrot set bounds
-    double fullMinCx = -2.5, fullMaxCx = 1.0;
-    double fullMinCy = -1.2, fullMaxCy = 1.2;
-    double fullWidth = fullMaxCx - fullMinCx;   // 3.5
-    double fullHeight = fullMaxCy - fullMinCy;  // 2.4
-
     // Calculate viewport size in full minimap pixels
     double viewScale = mb_view_get_scale(&_viewState);
     double halfW = (_viewState.viewport_width / 2.0) * viewScale;
@@ -636,7 +720,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     double viewWidth = viewMaxX - viewMinX;
 
     // Calculate indicator size on full minimap
-    double fullMapScaleX = MINIMAP_WIDTH / fullWidth;
+    double fullMapScaleX = MINIMAP_WIDTH / MB_FULL_WIDTH;
     double indicatorWidth = viewWidth * fullMapScaleX;
 
     // Determine if we need to zoom the minimap
@@ -656,8 +740,8 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
             double zoomRatio = minimapZoom / _minimapCachedZoomLevel;
             if (zoomRatio >= 0.5 && zoomRatio <= 2.0) {
                 // Check if center is still within cached bounds
-                double cachedWidth = fullWidth / _minimapCachedZoomLevel;
-                double cachedHeight = fullHeight / _minimapCachedZoomLevel;
+                double cachedWidth = MB_FULL_WIDTH / _minimapCachedZoomLevel;
+                double cachedHeight = MB_FULL_HEIGHT / _minimapCachedZoomLevel;
                 double dx = fabs(_viewState.center_x - _minimapCachedCenterX);
                 double dy = fabs(_viewState.center_y - _minimapCachedCenterY);
                 // Valid if center moved less than 25% of cached view size
@@ -714,36 +798,36 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     double mapMinCx, mapMaxCx, mapMinCy, mapMaxCy;
     if (useZoomedMinimap) {
         // Zoomed minimap - use cached bounds
-        double zoomedWidth = fullWidth / _minimapCachedZoomLevel;
-        double zoomedHeight = fullHeight / _minimapCachedZoomLevel;
+        double zoomedWidth = MB_FULL_WIDTH / _minimapCachedZoomLevel;
+        double zoomedHeight = MB_FULL_HEIGHT / _minimapCachedZoomLevel;
         mapMinCx = _minimapCachedCenterX - zoomedWidth / 2.0;
         mapMaxCx = _minimapCachedCenterX + zoomedWidth / 2.0;
         mapMinCy = _minimapCachedCenterY - zoomedHeight / 2.0;
         mapMaxCy = _minimapCachedCenterY + zoomedHeight / 2.0;
 
         // Clamp to full Mandelbrot bounds (matching renderMinimapZoomed)
-        if (mapMinCx < fullMinCx) {
-            mapMinCx = fullMinCx;
+        if (mapMinCx < MB_FULL_MIN_CX) {
+            mapMinCx = MB_FULL_MIN_CX;
             mapMaxCx = mapMinCx + zoomedWidth;
         }
-        if (mapMaxCx > fullMaxCx) {
-            mapMaxCx = fullMaxCx;
+        if (mapMaxCx > MB_FULL_MAX_CX) {
+            mapMaxCx = MB_FULL_MAX_CX;
             mapMinCx = mapMaxCx - zoomedWidth;
         }
-        if (mapMinCy < fullMinCy) {
-            mapMinCy = fullMinCy;
+        if (mapMinCy < MB_FULL_MIN_CY) {
+            mapMinCy = MB_FULL_MIN_CY;
             mapMaxCy = mapMinCy + zoomedHeight;
         }
-        if (mapMaxCy > fullMaxCy) {
-            mapMaxCy = fullMaxCy;
+        if (mapMaxCy > MB_FULL_MAX_CY) {
+            mapMaxCy = MB_FULL_MAX_CY;
             mapMinCy = mapMaxCy - zoomedHeight;
         }
     } else {
         // Full minimap
-        mapMinCx = fullMinCx;
-        mapMaxCx = fullMaxCx;
-        mapMinCy = fullMinCy;
-        mapMaxCy = fullMaxCy;
+        mapMinCx = MB_FULL_MIN_CX;
+        mapMaxCx = MB_FULL_MAX_CX;
+        mapMinCy = MB_FULL_MIN_CY;
+        mapMaxCy = MB_FULL_MAX_CY;
     }
 
     // Draw viewport rectangle (red)
@@ -908,31 +992,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     [NSGraphicsContext restoreGraphicsState];
 
     // Blit text to framebuffer
-    for (int ty = 0; ty < textHeight; ty++) {
-        int srcY = textHeight - 1 - ty;
-        int dstY = textY + ty;
-        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
-
-        for (int tx = 0; tx < textWidth; tx++) {
-            int dstX = textX + tx;
-            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
-
-            int srcIdx = srcY * textWidth + tx;
-            int dstIdx = dstY * _viewState.viewport_width + dstX;
-
-            uint8_t sr = textBitmap[srcIdx * 4 + 0];
-            uint8_t sg = textBitmap[srcIdx * 4 + 1];
-            uint8_t sb = textBitmap[srcIdx * 4 + 2];
-            uint8_t sa = textBitmap[srcIdx * 4 + 3];
-
-            if (sa > 0) {
-                float alpha = sa / 255.0f;
-                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
-                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
-                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
-            }
-        }
-    }
+    [self blitTextBitmap:textBitmap width:textWidth height:textHeight toX:textX y:textY];
 
     [attrStr release];
     CGContextRelease(ctx);
@@ -1107,32 +1167,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     // Blit text to framebuffer
     int textStartX = menuX + padding;
     int textStartY = menuY + padding / 2;
-
-    for (int ty = 0; ty < textHeight; ty++) {
-        int srcY = textHeight - 1 - ty;
-        int dstY = textStartY + ty;
-        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
-
-        for (int tx = 0; tx < textWidth; tx++) {
-            int dstX = textStartX + tx;
-            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
-
-            int srcIdx = srcY * textWidth + tx;
-            int dstIdx = dstY * _viewState.viewport_width + dstX;
-
-            uint8_t sr = textBitmap[srcIdx * 4 + 0];
-            uint8_t sg = textBitmap[srcIdx * 4 + 1];
-            uint8_t sb = textBitmap[srcIdx * 4 + 2];
-            uint8_t sa = textBitmap[srcIdx * 4 + 3];
-
-            if (sa > 0) {
-                float alpha = sa / 255.0f;
-                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
-                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
-                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
-            }
-        }
-    }
+    [self blitTextBitmap:textBitmap width:textWidth height:textHeight toX:textStartX y:textStartY];
 
     [attrStr release];
     CGContextRelease(ctx);
@@ -1183,7 +1218,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 - (void)scrollWheel:(NSEvent *)event {
     if (event.modifierFlags & NSEventModifierFlagCommand) {
         // Command+scroll = zoom
-        double delta = 1.0 + event.scrollingDeltaY * 0.05;
+        double delta = 1.0 + event.scrollingDeltaY * MB_SCROLL_SENSITIVITY;
         NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
         loc.y = self.bounds.size.height - loc.y;
         [self zoomTowardsPoint:loc delta:delta];
@@ -1233,6 +1268,93 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     [self invalidateCache];
 }
 
+// =============================================================================
+// Key Handler Implementations
+// =============================================================================
+
+static void handleResetView(MandelbrotView *self) {
+    [self startAnimationToX:-0.5 y:0.0 zoom:1.0];
+    self->_highPrecisionMode = NO;
+    self->_currentPrecision = 64;
+}
+
+static void handleZoomIn(MandelbrotView *self) {
+    [self zoomTowardsPoint:NSMakePoint(self->_viewState.viewport_width/2,
+                                        self->_viewState.viewport_height/2)
+                     delta:MB_ZOOM_IN_FACTOR];
+    [self invalidateCache];
+}
+
+static void handleZoomOut(MandelbrotView *self) {
+    [self zoomTowardsPoint:NSMakePoint(self->_viewState.viewport_width/2,
+                                        self->_viewState.viewport_height/2)
+                     delta:MB_ZOOM_OUT_FACTOR];
+    [self invalidateCache];
+}
+
+static void handleToggleHUD(MandelbrotView *self) {
+    self->_showHUD = !self->_showHUD;
+    self->_needsRedraw = YES;
+}
+
+static void handleToggleMinimap(MandelbrotView *self) {
+    self->_showMinimap = !self->_showMinimap;
+    self->_needsRedraw = YES;
+}
+
+static void handleToggleCoordinates(MandelbrotView *self) {
+    self->_showCoordinates = !self->_showCoordinates;
+    self->_needsRedraw = YES;
+}
+
+static void handleTogglePresetMenu(MandelbrotView *self) {
+    self->_showPresetMenu = !self->_showPresetMenu;
+    self->_needsRedraw = YES;
+}
+
+static void handleEscape(MandelbrotView *self) {
+    [self.window close];
+}
+
+static void handlePanUp(MandelbrotView *self) {
+    double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
+    self->_viewState.center_y -= panAmount;
+    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    [self invalidateCache];
+}
+
+static void handlePanDown(MandelbrotView *self) {
+    double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
+    self->_viewState.center_y += panAmount;
+    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    [self invalidateCache];
+}
+
+static void handlePanLeft(MandelbrotView *self) {
+    double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
+    self->_viewState.center_x -= panAmount;
+    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    [self invalidateCache];
+}
+
+static void handlePanRight(MandelbrotView *self) {
+    double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
+    self->_viewState.center_x += panAmount;
+    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    [self invalidateCache];
+}
+
+static void handlePresetKey(MandelbrotView *self, unichar key) {
+    for (int i = 0; i < kPresetCount; i++) {
+        if (kPresetLocations[i].key == key) {
+            [self startAnimationToX:kPresetLocations[i].center_x
+                                  y:kPresetLocations[i].center_y
+                               zoom:kPresetLocations[i].zoom];
+            break;
+        }
+    }
+}
+
 - (void)keyDown:(NSEvent *)event {
     NSString *chars = [event charactersIgnoringModifiers];
     if (!chars || [chars length] == 0) {
@@ -1255,7 +1377,6 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
                 _needsRedraw = YES;
                 return;
             case 13: // Enter/Return
-                // Navigate to selected preset
                 [self startAnimationToX:kPresetLocations[_selectedPresetIdx].center_x
                                       y:kPresetLocations[_selectedPresetIdx].center_y
                                    zoom:kPresetLocations[_selectedPresetIdx].zoom];
@@ -1263,106 +1384,49 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
                 _needsRedraw = YES;
                 return;
             case 27: // Escape
-                _showPresetMenu = NO;
-                _needsRedraw = YES;
-                return;
             case 'p':
             case 'P':
                 _showPresetMenu = NO;
                 _needsRedraw = YES;
                 return;
         }
-        // Allow other keys to close menu and perform action
     }
 
-    double panAmount = 50.0 * mb_view_get_scale(&_viewState);
-
+    // Handle arrow keys for panning (not in dispatch table due to special preset menu handling)
     switch (key) {
-        case 'r':
-        case 'R':
-            // Reset view with animation
-            [self startAnimationToX:-0.5 y:0.0 zoom:1.0];
-            _highPrecisionMode = NO;
-            _currentPrecision = 64;
-            return;
-        case '=':
-        case '+':
-            // Zoom in
-            [self zoomTowardsPoint:NSMakePoint(_viewState.viewport_width/2, _viewState.viewport_height/2) delta:1.5];
-            [self invalidateCache];
-            return;
-        case '-':
-            // Zoom out
-            [self zoomTowardsPoint:NSMakePoint(_viewState.viewport_width/2, _viewState.viewport_height/2) delta:0.67];
-            [self invalidateCache];
-            return;
         case NSUpArrowFunctionKey:
-            _viewState.center_y -= panAmount;
-            if (_highPrecisionMode) [self syncHPCenterStrings];
-            [self invalidateCache];
+            handlePanUp(self);
             return;
         case NSDownArrowFunctionKey:
-            _viewState.center_y += panAmount;
-            if (_highPrecisionMode) [self syncHPCenterStrings];
-            [self invalidateCache];
+            handlePanDown(self);
             return;
         case NSLeftArrowFunctionKey:
-            _viewState.center_x -= panAmount;
-            if (_highPrecisionMode) [self syncHPCenterStrings];
-            [self invalidateCache];
+            handlePanLeft(self);
             return;
         case NSRightArrowFunctionKey:
-            _viewState.center_x += panAmount;
-            if (_highPrecisionMode) [self syncHPCenterStrings];
-            [self invalidateCache];
-            return;
-        case 27: // Escape
-            [self.window close];
-            return;
-        case 'p':
-        case 'P':
-            _showPresetMenu = !_showPresetMenu;
-            _needsRedraw = YES;
-            return;
-        case 'i':
-        case 'I':
-            _showHUD = !_showHUD;
-            _needsRedraw = YES;
-            return;
-        case 'm':
-        case 'M':
-            _showMinimap = !_showMinimap;
-            _needsRedraw = YES;
-            return;
-        case 'c':
-        case 'C':
-            _showCoordinates = !_showCoordinates;
-            _needsRedraw = YES;
-            return;
-        case '1':
-        case '2':
-        case '3':
-        case '4':
-        case '5':
-        case '6':
-        case '7':
-        case '8':
-        case '9': {
-            // Navigate to preset location (if key matches a preset's hotkey)
-            for (int i = 0; i < kPresetCount; i++) {
-                if (kPresetLocations[i].key == key) {
-                    [self startAnimationToX:kPresetLocations[i].center_x
-                                          y:kPresetLocations[i].center_y
-                                       zoom:kPresetLocations[i].zoom];
-                    break;
-                }
-            }
-            return;
-        }
-        default:
-            [super keyDown:event];
+            handlePanRight(self);
             return;
     }
+
+    // Check dispatch table for key bindings
+    for (int i = 0; i < kKeyBindingsCount; i++) {
+        if (key == kKeyBindings[i].key || key == kKeyBindings[i].altKey) {
+            if (_showPresetMenu && kKeyBindings[i].closesPresetMenu) {
+                _showPresetMenu = NO;
+            }
+            kKeyBindings[i].handler(self);
+            return;
+        }
+    }
+
+    // Handle preset hotkeys (1-9)
+    if (key >= '1' && key <= '9') {
+        handlePresetKey(self, key);
+        return;
+    }
+
+    // Pass unhandled keys to super
+    [super keyDown:event];
 }
 
 // =============================================================================
@@ -1481,24 +1545,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
             double cy = min_cy + (ly + 0.5) * scale_y;
             for (int lx = 0; lx < MB_MAP_TILE_SIZE; lx++) {
                 double cx = min_cx + (lx + 0.5) * scale_x;
-
-                unsigned int iteration;
-                if (mb_is_in_cardioid_or_bulb(cx, cy)) {
-                    iteration = MAX_ITER;
-                } else {
-                    double zx = 0.0, zy = 0.0;
-                    double zx2 = 0.0, zy2 = 0.0;
-                    iteration = 0;
-
-                    while (zx2 + zy2 < 4.0 && iteration < MAX_ITER) {
-                        zy = 2.0 * zx * zy + cy;
-                        zx = zx2 - zy2 + cx;
-                        zx2 = zx * zx;
-                        zy2 = zy * zy;
-                        iteration++;
-                    }
-                }
-
+                unsigned int iteration = mb_compute_point(cx, cy, MAX_ITER);
                 color_from_iteration(&tileBuf[ly * MB_MAP_TILE_SIZE + lx], iteration);
             }
         }
@@ -1889,38 +1936,9 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     [NSGraphicsContext restoreGraphicsState];
 
     // Copy text bitmap to framebuffer with alpha blending
-    // Flip Y because CG uses bottom-left origin, framebuffer uses top-left
     int textStartX = hudX + padding;
     int textStartY = hudY + padding / 2;
-
-    for (int ty = 0; ty < textHeight; ty++) {
-        int srcY = textHeight - 1 - ty;  // Flip: top of framebuffer gets bottom of CG bitmap
-        int dstY = textStartY + ty;
-
-        if (dstY < 0 || dstY >= _viewState.viewport_height) continue;
-
-        for (int tx = 0; tx < textWidth; tx++) {
-            int dstX = textStartX + tx;
-            if (dstX < 0 || dstX >= _viewState.viewport_width) continue;
-
-            int srcIdx = srcY * textWidth + tx;
-            int dstIdx = dstY * _viewState.viewport_width + dstX;
-
-            // Get source RGBA
-            uint8_t sr = textBitmap[srcIdx * 4 + 0];
-            uint8_t sg = textBitmap[srcIdx * 4 + 1];
-            uint8_t sb = textBitmap[srcIdx * 4 + 2];
-            uint8_t sa = textBitmap[srcIdx * 4 + 3];
-
-            if (sa > 0) {
-                // Alpha blend
-                float alpha = sa / 255.0f;
-                _framebuffer[dstIdx].r = (uint8_t)(sr * alpha + _framebuffer[dstIdx].r * (1 - alpha));
-                _framebuffer[dstIdx].g = (uint8_t)(sg * alpha + _framebuffer[dstIdx].g * (1 - alpha));
-                _framebuffer[dstIdx].b = (uint8_t)(sb * alpha + _framebuffer[dstIdx].b * (1 - alpha));
-            }
-        }
-    }
+    [self blitTextBitmap:textBitmap width:textWidth height:textHeight toX:textStartX y:textStartY];
 
     // Cleanup
     [attrStr release];
@@ -2045,7 +2063,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 @implementation MandelbrotAppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
-    NSLog(@"applicationDidFinishLaunching");
+    MB_DEBUG_LOG(@"applicationDidFinishLaunching");
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
@@ -2069,29 +2087,29 @@ static MandelbrotView *g_view = nil;
 // =============================================================================
 
 int native_viewer_init(const char *title, int width, int height, bool clear_cache) {
-    NSLog(@"native_viewer_init: starting");
+    MB_DEBUG_LOG(@"native_viewer_init: starting");
 
     // Clear disk cache if requested
     if (clear_cache) {
-        NSString *cachePath = [@CACHE_PATH stringByExpandingTildeInPath];
+        NSString *cachePath = getCachePath();
         NSError *error = nil;
         if ([[NSFileManager defaultManager] removeItemAtPath:cachePath error:&error]) {
-            NSLog(@"Cleared disk cache at %@", cachePath);
+            MB_DEBUG_LOG(@"Cleared disk cache at %@", cachePath);
         } else if (error && error.code != NSFileNoSuchFileError) {
-            NSLog(@"Warning: Failed to clear cache at %@: %@", cachePath, error.localizedDescription);
+            MB_DEBUG_LOG(@"Warning: Failed to clear cache at %@: %@", cachePath, error.localizedDescription);
         }
     }
 
     // Initialize application
     [NSApplication sharedApplication];
-    NSLog(@"native_viewer_init: got NSApp");
+    MB_DEBUG_LOG(@"native_viewer_init: got NSApp");
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 
     // Set app delegate for proper termination handling
     g_appDelegate = [[MandelbrotAppDelegate alloc] init];
     [g_appDelegate retain];
     [NSApp setDelegate:g_appDelegate];
-    NSLog(@"native_viewer_init: set activation policy");
+    MB_DEBUG_LOG(@"native_viewer_init: set activation policy");
 
     // Create menu bar (required for proper app activation)
     NSMenu *menuBar = [[NSMenu alloc] init];
@@ -2124,15 +2142,15 @@ int native_viewer_init(const char *title, int width, int height, bool clear_cach
     [g_window setMinSize:NSMakeSize(400, 300)];
 
     // Create view
-    NSLog(@"native_viewer_init: creating view");
+    MB_DEBUG_LOG(@"native_viewer_init: creating view");
     g_view = [[MandelbrotView alloc] initWithFrame:frame];
     if (!g_view) {
-        NSLog(@"native_viewer_init: view creation FAILED");
+        MB_DEBUG_LOG(@"native_viewer_init: view creation FAILED");
         [g_window release];
         return -1;
     }
     [g_view retain];  // Retain for non-ARC
-    NSLog(@"native_viewer_init: view created");
+    MB_DEBUG_LOG(@"native_viewer_init: view created");
 
     [g_window setContentView:g_view];
 
@@ -2143,7 +2161,7 @@ int native_viewer_init(const char *title, int width, int height, bool clear_cach
     [g_window setDelegate:g_windowController];
 
     // Show window
-    NSLog(@"native_viewer_init: showing window");
+    MB_DEBUG_LOG(@"native_viewer_init: showing window");
     [g_window setIsVisible:YES];
     [g_window makeKeyAndOrderFront:nil];
     [g_window orderFrontRegardless];
@@ -2151,19 +2169,19 @@ int native_viewer_init(const char *title, int width, int height, bool clear_cach
     [g_window center];
 
     [NSApp activateIgnoringOtherApps:YES];
-    NSLog(@"native_viewer_init: window visible=%d, frame=%@",
+    MB_DEBUG_LOG(@"native_viewer_init: window visible=%d, frame=%@",
           [g_window isVisible], NSStringFromRect([g_window frame]));
-    NSLog(@"native_viewer_init: done, returning 0");
+    MB_DEBUG_LOG(@"native_viewer_init: done, returning 0");
 
     return 0;
 }
 
 void native_viewer_run(void) {
-    NSLog(@"native_viewer_run: starting run loop");
+    MB_DEBUG_LOG(@"native_viewer_run: starting run loop");
     [NSApp finishLaunching];
-    NSLog(@"native_viewer_run: finishLaunching done, calling run");
+    MB_DEBUG_LOG(@"native_viewer_run: finishLaunching done, calling run");
     [NSApp run];
-    NSLog(@"native_viewer_run: run returned");
+    MB_DEBUG_LOG(@"native_viewer_run: run returned");
 }
 
 void native_viewer_shutdown(void) {

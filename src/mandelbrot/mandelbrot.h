@@ -27,6 +27,17 @@ int mb_is_in_cardioid_or_bulb(double cx, double cy);
 unsigned int mb_compute_iteration_scalar(double cx, double cy);
 
 /**
+ * Compute iteration count for a single point with custom max iteration limit.
+ * Includes cardioid/bulb early-out optimization.
+ *
+ * @param cx Real part of complex coordinate
+ * @param cy Imaginary part of complex coordinate
+ * @param max_iter Maximum iterations before considering point in set
+ * @return Number of iterations before escape, or max_iter if in set
+ */
+unsigned int mb_compute_point(double cx, double cy, unsigned int max_iter);
+
+/**
  * Compute iteration count for two points simultaneously using SIMD.
  * Falls back to scalar if one point is in cardioid/bulb.
  *

@@ -28,16 +28,20 @@ int mb_is_in_cardioid_or_bulb(double cx, double cy) {
 // =============================================================================
 
 unsigned int mb_compute_iteration_scalar(double cx, double cy) {
+    return mb_compute_point(cx, cy, MB_MAX_ITER);
+}
+
+unsigned int mb_compute_point(double cx, double cy, unsigned int max_iter) {
     // Skip known interior points
     if (mb_is_in_cardioid_or_bulb(cx, cy)) {
-        return MB_MAX_ITER;
+        return max_iter;
     }
 
     double zx = 0.0, zy = 0.0;
     double zx2 = 0.0, zy2 = 0.0;
     unsigned int iteration = 0;
 
-    while (zx2 + zy2 < 4.0 && iteration < MB_MAX_ITER) {
+    while (zx2 + zy2 < 4.0 && iteration < max_iter) {
         zy = 2.0 * zx * zy + cy;
         zx = zx2 - zy2 + cx;
         zx2 = zx * zx;
@@ -67,22 +71,7 @@ void mb_compute_tile_double(double center_x, double center_y, double scale,
             double cy = center_y + (py - vp_half_h) * scale;
 
             // Compute iteration with cardioid/bulb skip
-            unsigned int iteration;
-            if (mb_is_in_cardioid_or_bulb(cx, cy)) {
-                iteration = (unsigned int)max_iter;
-            } else {
-                double zx = 0.0, zy = 0.0;
-                double zx2 = 0.0, zy2 = 0.0;
-                iteration = 0;
-
-                while (zx2 + zy2 < 4.0 && iteration < (unsigned int)max_iter) {
-                    zy = 2.0 * zx * zy + cy;
-                    zx = zx2 - zy2 + cx;
-                    zx2 = zx * zx;
-                    zy2 = zy * zy;
-                    iteration++;
-                }
-            }
+            unsigned int iteration = mb_compute_point(cx, cy, (unsigned int)max_iter);
 
             // Convert to color
             color_from_iteration(&output[ly * tile_size + lx], iteration);

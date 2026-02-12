@@ -211,13 +211,18 @@ int disk_cache_get(DiskCache *cache, const MapTile *tile, PixelColor *pixels) {
         return -1;
     }
 
-    // Get file size
+    // Get file size with error checking
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
+    if (file_size < 0 || file_size > MB_MAX_TILE_FILE_SIZE) {
+        fclose(f);
+        pthread_mutex_unlock(&cache->mutex);
+        return -1;
+    }
     fseek(f, 0, SEEK_SET);
 
     // Read file contents
-    unsigned char *data = (unsigned char *)malloc(file_size);
+    unsigned char *data = (unsigned char *)malloc((size_t)file_size);
     if (!data) {
         fclose(f);
         pthread_mutex_unlock(&cache->mutex);
@@ -328,13 +333,17 @@ int disk_cache_put(DiskCache *cache, const MapTile *tile, const PixelColor *pixe
     } else {
         // Create new entry
         entry = (LRUEntry *)calloc(1, sizeof(LRUEntry));
-        if (entry) {
-            strncpy(entry->path, path, sizeof(entry->path) - 1);
-            entry->size = encoded_size;
-            entry->last_access = time(NULL);
-            cache->current_size += encoded_size;
-            lru_add_front(cache, entry);
+        if (!entry) {
+            // Allocation failed - file was written but won't be tracked in LRU
+            // This is acceptable; the file will still be accessible via disk
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;  // Still return success since file was written
         }
+        strncpy(entry->path, path, sizeof(entry->path) - 1);
+        entry->size = encoded_size;
+        entry->last_access = time(NULL);
+        cache->current_size += encoded_size;
+        lru_add_front(cache, entry);
     }
 
     // Evict if necessary

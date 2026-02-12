@@ -19,6 +19,7 @@
 
 #define MB_DISK_CACHE_MAX_ZOOM 20
 #define MB_DISK_CACHE_DEFAULT_SIZE (1024LL * 1024 * 1024)  // 1GB default
+#define MB_MAX_TILE_FILE_SIZE (1024 * 1024)  // 1MB max tile file (safety limit)
 
 typedef struct DiskCache DiskCache;
 

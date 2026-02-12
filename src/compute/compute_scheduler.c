@@ -21,7 +21,6 @@ int scheduler_init(ComputeScheduler *sched, int tile_size, int max_iter) {
 
     sched->tile_size = tile_size;
     sched->max_iter = max_iter;
-    sched->using_double = false;
     sched->perturbation_enabled = false;
     sched->high_precision_mode = false;
     sched->current_precision = 64;
@@ -164,14 +163,6 @@ void scheduler_update_view(ComputeScheduler *sched, const MBViewState *view) {
         }
     }
 
-    // Legacy double precision check (kept for fallback)
-    bool needs_double = mb_view_needs_double(view);
-    if (needs_double != sched->using_double) {
-        if (!sched->perturbation_enabled) {
-            tile_cache_new_generation(&sched->cache);
-        }
-        sched->using_double = needs_double;
-    }
 }
 
 // Handle glitched pixels with CPU double-precision fallback
@@ -222,11 +213,8 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
         .generation = gen
     };
 
-    CachedTile *cached = tile_cache_get(&sched->cache, &key);
-    if (cached) {
-        // Cache hit - copy pixels
-        size_t pixels = (size_t)sched->tile_size * sched->tile_size;
-        memcpy(output, cached->pixels, pixels * sizeof(PixelColor));
+    // tile_cache_get copies pixels under lock (thread-safe)
+    if (tile_cache_get(&sched->cache, &key, output) == 0) {
         return true;
     }
 
@@ -300,26 +288,6 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
     return true;
 }
 
-void scheduler_get_visible_tiles(const MBViewState *view, int tile_size,
-                                 int *out_start_x, int *out_start_y,
-                                 int *out_end_x, int *out_end_y) {
-    // Get bounds in tile coordinates
-    // We compute one extra tile on each edge for smooth scrolling
-    int start_x = -1;  // Start before viewport for smooth scrolling
-    int start_y = -1;
-    int end_x = (view->viewport_width + tile_size - 1) / tile_size + 1;
-    int end_y = (view->viewport_height + tile_size - 1) / tile_size + 1;
-
-    *out_start_x = start_x;
-    *out_start_y = start_y;
-    *out_end_x = end_x;
-    *out_end_y = end_y;
-}
-
-bool scheduler_using_double(const ComputeScheduler *sched) {
-    return sched->using_double;
-}
-
 void scheduler_cleanup(ComputeScheduler *sched) {
     tile_cache_cleanup(&sched->cache);
     ref_orbit_cleanup(&sched->ref_orbit);
@@ -343,7 +311,7 @@ void scheduler_cleanup(ComputeScheduler *sched) {
 }
 
 // =============================================================================
-// Map Tile API Implementation
+// Disk Cache API Implementation
 // =============================================================================
 
 int scheduler_init_disk_cache(ComputeScheduler *sched, const char *cache_path,
@@ -352,59 +320,4 @@ int scheduler_init_disk_cache(ComputeScheduler *sched, const char *cache_path,
 
     sched->disk_cache = disk_cache_init(cache_path, max_size_bytes);
     return sched->disk_cache ? 0 : -1;
-}
-
-bool scheduler_get_map_tile(ComputeScheduler *sched, const MapTile *tile,
-                            PixelColor *output) {
-    if (!sched || !tile || !output) return false;
-
-    // 1. Check disk cache first
-    if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && sched->disk_cache) {
-        if (disk_cache_get(sched->disk_cache, tile, output) == 0) {
-            return true;
-        }
-    }
-
-    // 2. Get tile bounds
-    double min_cx, max_cx, min_cy, max_cy;
-    mb_tile_to_bounds(tile, &min_cx, &max_cx, &min_cy, &max_cy);
-
-    // 3. Compute separate X and Y scales
-    double scale_x = (max_cx - min_cx) / MB_MAP_TILE_SIZE;
-    double scale_y = (max_cy - min_cy) / MB_MAP_TILE_SIZE;
-
-    // 4. Compute each pixel with correct coordinates
-    for (int ly = 0; ly < MB_MAP_TILE_SIZE; ly++) {
-        double cy = min_cy + (ly + 0.5) * scale_y;
-        for (int lx = 0; lx < MB_MAP_TILE_SIZE; lx++) {
-            double cx = min_cx + (lx + 0.5) * scale_x;
-
-            // Compute iteration
-            unsigned int iteration;
-            if (mb_is_in_cardioid_or_bulb(cx, cy)) {
-                iteration = sched->max_iter;
-            } else {
-                double zx = 0.0, zy = 0.0;
-                double zx2 = 0.0, zy2 = 0.0;
-                iteration = 0;
-
-                while (zx2 + zy2 < 4.0 && iteration < (unsigned int)sched->max_iter) {
-                    zy = 2.0 * zx * zy + cy;
-                    zx = zx2 - zy2 + cx;
-                    zx2 = zx * zx;
-                    zy2 = zy * zy;
-                    iteration++;
-                }
-            }
-
-            color_from_iteration(&output[ly * MB_MAP_TILE_SIZE + lx], iteration);
-        }
-    }
-
-    // 5. Save to disk cache
-    if (tile->zoom <= MB_DISK_CACHE_MAX_ZOOM && sched->disk_cache) {
-        disk_cache_put(sched->disk_cache, tile, output);
-    }
-
-    return true;
 }

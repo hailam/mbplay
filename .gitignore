@@ -8,3 +8,15 @@ build/
 .vscode/
 compile_commands.json
 
+# Build artifacts
+*.o
+*.a
+*.dylib
+
+# Generated files
+src/gpu/mandelbrot_shader.h
+
+# Output files
+*.png
+*.qoi
+

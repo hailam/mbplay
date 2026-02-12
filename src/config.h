@@ -100,10 +100,6 @@ typedef struct {
 #define MB_REF_ORBIT_MAX_ITER 4096
 #define MB_GLITCH_MARKER 0xFFFFFFFE
 
-// Legacy: Switch to CPU double precision above this zoom level
-// With perturbation enabled, GPU can render at any zoom level
-#define MB_FLOAT_ZOOM_LIMIT 1e15  // Effectively disabled with perturbation
-
 // =============================================================================
 // High-Precision (Arbitrary Precision) Configuration
 // =============================================================================
@@ -178,11 +174,6 @@ static inline void mb_complex_to_pixel(
 // Get the current scale (complex units per pixel)
 static inline double mb_view_get_scale(const MBViewState *view) {
     return (2.0 / view->viewport_height) / view->zoom_level;
-}
-
-// Check if we need double precision at current zoom level
-static inline int mb_view_needs_double(const MBViewState *view) {
-    return view->zoom_level >= MB_FLOAT_ZOOM_LIMIT;
 }
 
 // Check if we need high-precision mode at current zoom level

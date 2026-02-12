@@ -83,7 +83,7 @@ int tile_cache_init(TileCache *cache) {
     return 0;
 }
 
-CachedTile* tile_cache_get(TileCache *cache, const TileKey *key) {
+int tile_cache_get(TileCache *cache, const TileKey *key, PixelColor *output) {
     pthread_mutex_t *mutex = (pthread_mutex_t*)cache->mutex;
     pthread_mutex_lock(mutex);
 
@@ -91,14 +91,17 @@ CachedTile* tile_cache_get(TileCache *cache, const TileKey *key) {
         if (cache->tiles[i].valid && tile_key_equals(&cache->tiles[i].key, key)) {
             cache->tiles[i].last_used = ++cache->access_counter;
             cache_hits++;
+            // Copy pixels while holding the lock to prevent use-after-free
+            size_t tile_pixels = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE;
+            memcpy(output, cache->tiles[i].pixels, tile_pixels * sizeof(PixelColor));
             pthread_mutex_unlock(mutex);
-            return &cache->tiles[i];
+            return 0;
         }
     }
 
     cache_misses++;
     pthread_mutex_unlock(mutex);
-    return NULL;
+    return -1;
 }
 
 int tile_cache_put(TileCache *cache, const TileKey *key, const PixelColor *pixels) {
@@ -145,7 +148,11 @@ void tile_cache_new_generation(TileCache *cache) {
 }
 
 uint32_t tile_cache_get_generation(const TileCache *cache) {
-    return cache->current_generation;
+    pthread_mutex_t *mutex = (pthread_mutex_t*)cache->mutex;
+    pthread_mutex_lock(mutex);
+    uint32_t gen = cache->current_generation;
+    pthread_mutex_unlock(mutex);
+    return gen;
 }
 
 void tile_cache_clear(TileCache *cache) {

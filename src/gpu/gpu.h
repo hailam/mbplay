@@ -9,6 +9,32 @@
 // =============================================================================
 // GPU Compute API (Metal via CMT)
 // =============================================================================
+//
+// This module provides GPU-accelerated Mandelbrot computation via Metal.
+// There are several APIs depending on use case and zoom level:
+//
+// 1. BASIC API (gpu_compute_row, gpu_compute_full)
+//    - Float precision, direct computation
+//    - Use for batch rendering at standard zoom levels (zoom < 1e6)
+//
+// 2. TILE API (gpu_compute_tile)
+//    - Float precision, tile-based
+//    - Use for interactive viewer at standard zoom levels
+//
+// 3. PERTURBATION V1 API (gpu_compute_tile_perturb)
+//    - Uses perturbation theory with float deltas
+//    - Deprecated: use V2 for better precision at deep zoom
+//
+// 4. PERTURBATION V2 API (gpu_compute_tile_perturb_v2)
+//    - Uses perturbation theory with double-precision deltas
+//    - Pre-computes deltas on CPU, runs iteration on GPU
+//    - Use for deep zoom (1e6 < zoom < 1e12)
+//
+// 5. HIGH-PRECISION API (gpu_precompute_deltas_hp + V2 compute)
+//    - Uses arbitrary precision for delta computation
+//    - Supports zoom levels beyond double precision limits
+//    - Use for extreme deep zoom (zoom > 1e12)
+//
 
 /**
  * Check if Metal GPU is available on this system.

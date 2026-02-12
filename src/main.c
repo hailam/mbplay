@@ -7,7 +7,6 @@
 #include "gpu/gpu.h"
 #include "stream/stream.h"
 #include "viewer/viewer.h"
-#include "render/render.h"
 #include "mandelbrot/mandelbrot.h"
 #include "color/color.h"
 
@@ -165,7 +164,10 @@ int main(int argc, char **argv) {
         }
 
         // Write to file immediately
-        stream_write_row(stream, row);
+        if (!stream_write_row(stream, row)) {
+            fprintf(stderr, "Error: Failed to write row %d\n", y);
+            break;
+        }
 
         // Update viewer periodically
         if (show_viewer) {

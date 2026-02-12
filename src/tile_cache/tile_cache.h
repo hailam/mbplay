@@ -42,12 +42,14 @@ typedef struct {
 int tile_cache_init(TileCache *cache);
 
 /**
- * Look up a tile in the cache.
+ * Look up a tile in the cache and copy pixels to output buffer.
+ * Thread-safe: pixels are copied while mutex is held.
  * @param cache The tile cache
  * @param key Tile key to look up
- * @return Pointer to cached tile if found and valid, NULL otherwise
+ * @param output Output buffer for pixel data (must be tile_size^2 pixels)
+ * @return 0 on cache hit (pixels copied), -1 on cache miss
  */
-CachedTile* tile_cache_get(TileCache *cache, const TileKey *key);
+int tile_cache_get(TileCache *cache, const TileKey *key, PixelColor *output);
 
 /**
  * Add or update a tile in the cache.

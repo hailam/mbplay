@@ -18,7 +18,6 @@ typedef struct {
     int tile_size;
     int max_iter;
     bool gpu_available;
-    bool using_double;  // True when zoom >= MB_FLOAT_ZOOM_LIMIT (legacy, unused with perturbation)
 
     // Perturbation state (standard double precision)
     ReferenceOrbit ref_orbit;
@@ -69,38 +68,17 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
                         int tile_x, int tile_y, PixelColor *output);
 
 /**
- * Get tiles visible in current view.
- * @param view Current view state
- * @param tile_size Size of tiles
- * @param out_start_x Output: first visible tile X
- * @param out_start_y Output: first visible tile Y
- * @param out_end_x Output: last visible tile X (exclusive)
- * @param out_end_y Output: last visible tile Y (exclusive)
- */
-void scheduler_get_visible_tiles(const MBViewState *view, int tile_size,
-                                 int *out_start_x, int *out_start_y,
-                                 int *out_end_x, int *out_end_y);
-
-/**
- * Check if currently using double precision.
- * @param sched The scheduler
- * @return true if using CPU double precision
- */
-bool scheduler_using_double(const ComputeScheduler *sched);
-
-/**
  * Clean up scheduler resources.
  * @param sched The scheduler
  */
 void scheduler_cleanup(ComputeScheduler *sched);
 
 // =============================================================================
-// Map Tile API (z/x/y coordinates like web maps)
+// Disk Cache API
 // =============================================================================
 
 /**
  * Initialize disk cache for persistent map tile storage.
- * Call this before using scheduler_get_map_tile.
  * @param sched The scheduler
  * @param cache_path Base path for tile cache (e.g., ~/.mandelbrot/tiles)
  * @param max_size_bytes Maximum cache size (0 for default 1GB)
@@ -108,16 +86,5 @@ void scheduler_cleanup(ComputeScheduler *sched);
  */
 int scheduler_init_disk_cache(ComputeScheduler *sched, const char *cache_path,
                               int64_t max_size_bytes);
-
-/**
- * Get or compute a map tile using z/x/y coordinates.
- * Checks disk cache first, then computes if needed.
- * @param sched The scheduler
- * @param tile Map tile identifier (z/x/y)
- * @param output Output buffer (MB_TILE_SIZE * MB_TILE_SIZE pixels)
- * @return true on success, false on error
- */
-bool scheduler_get_map_tile(ComputeScheduler *sched, const MapTile *tile,
-                            PixelColor *output);
 
 #endif // MB_COMPUTE_SCHEDULER_H
