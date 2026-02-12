@@ -19,24 +19,7 @@ static void cpu_compute_row(const MBConfig *cfg, int y, PixelColor *output) {
 
     for (int x = 0; x < cfg->width; x++) {
         double cx = (x - cfg->width_half) * cfg->cx_scale;
-
-        unsigned int iteration;
-        if (mb_is_in_cardioid_or_bulb(cx, cy)) {
-            iteration = cfg->max_iter;
-        } else {
-            double zx = 0.0, zy = 0.0;
-            double zx2 = 0.0, zy2 = 0.0;
-            iteration = 0;
-
-            while (zx2 + zy2 < 4.0 && iteration < (unsigned int)cfg->max_iter) {
-                zy = 2.0 * zx * zy + cy;
-                zx = zx2 - zy2 + cx;
-                zx2 = zx * zx;
-                zy2 = zy * zy;
-                iteration++;
-            }
-        }
-
+        unsigned int iteration = mb_compute_point(cx, cy, (unsigned int)cfg->max_iter);
         color_from_iteration(&output[x], iteration);
     }
 }

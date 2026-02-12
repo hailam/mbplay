@@ -183,19 +183,7 @@ static void handle_glitches(ComputeScheduler *sched, const MBViewState *view,
                 double cx = view->center_x + (px - vp_half_w) * scale;
                 double cy = view->center_y + (py - vp_half_h) * scale;
 
-                // Full iteration (no cardioid check since we're at deep zoom)
-                double zx = 0.0, zy = 0.0;
-                double zx2 = 0.0, zy2 = 0.0;
-                unsigned int iteration = 0;
-
-                while (zx2 + zy2 < 4.0 && iteration < (unsigned int)sched->max_iter) {
-                    zy = 2.0 * zx * zy + cy;
-                    zx = zx2 - zy2 + cx;
-                    zx2 = zx * zx;
-                    zy2 = zy * zy;
-                    iteration++;
-                }
-
+                unsigned int iteration = mb_compute_point(cx, cy, (unsigned int)sched->max_iter);
                 color_from_iteration(&output[idx], iteration);
             }
         }
