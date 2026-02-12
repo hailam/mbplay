@@ -66,6 +66,17 @@ static MtComputePipelineState *pipelinePerturbV2 = NULL;
 static MtBuffer *perturbParamsV2Buffer = NULL;
 static MtBuffer *deltaBuffer = NULL;
 
+// Smooth coloring state
+static MtComputePipelineState *pipelineTileSmooth = NULL;
+static MtComputePipelineState *pipelinePerturbV2Smooth = NULL;
+static MtBuffer *finalZ2Buffer = NULL;
+static bool smoothInitialized = false;
+
+// Supersampling state
+static MtComputePipelineState *pipelineTileSS4 = NULL;
+static MtBuffer *smoothIterBuffer = NULL;
+static bool supersampleInitialized = false;
+
 // TileParams struct for GPU (must match Metal shader)
 typedef struct {
     float center_x;
@@ -245,6 +256,32 @@ void gpu_compute_full(PixelColor *output) {
 }
 
 void gpu_cleanup(void) {
+    // Supersampling buffers
+    if (smoothIterBuffer) {
+        mtRelease(smoothIterBuffer);
+        smoothIterBuffer = NULL;
+    }
+    if (pipelineTileSS4) {
+        mtRelease(pipelineTileSS4);
+        pipelineTileSS4 = NULL;
+    }
+    supersampleInitialized = false;
+
+    // Smooth coloring buffers
+    if (finalZ2Buffer) {
+        mtRelease(finalZ2Buffer);
+        finalZ2Buffer = NULL;
+    }
+    if (pipelinePerturbV2Smooth) {
+        mtRelease(pipelinePerturbV2Smooth);
+        pipelinePerturbV2Smooth = NULL;
+    }
+    if (pipelineTileSmooth) {
+        mtRelease(pipelineTileSmooth);
+        pipelineTileSmooth = NULL;
+    }
+    smoothInitialized = false;
+
     // Perturbation V2 buffers
     if (deltaBuffer) {
         mtRelease(deltaBuffer);
@@ -523,6 +560,38 @@ int gpu_init_perturbation(uint32_t max_iter) {
         return -1;
     }
 
+    // Initialize smooth coloring pipelines
+    MtFunction *kernelTileSmooth = mtNewFunctionWithName(library, "mandelbrot_compute_tile_smooth");
+    if (kernelTileSmooth) {
+        pipelineTileSmooth = mtNewComputePipelineStateWithFunction(device, kernelTileSmooth, NULL);
+        mtRelease(kernelTileSmooth);
+    }
+
+    MtFunction *kernelPerturbV2Smooth = mtNewFunctionWithName(library, "mandelbrot_compute_perturb_v2_smooth");
+    if (kernelPerturbV2Smooth) {
+        pipelinePerturbV2Smooth = mtNewComputePipelineStateWithFunction(device, kernelPerturbV2Smooth, NULL);
+        mtRelease(kernelPerturbV2Smooth);
+    }
+
+    // Allocate final_z2 buffer (one float per pixel)
+    size_t z2BufferSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(float);
+    finalZ2Buffer = mtDeviceNewBufferWithLength(device, z2BufferSize, MtResourceStorageModeShared);
+
+    smoothInitialized = (pipelineTileSmooth != NULL && pipelinePerturbV2Smooth != NULL && finalZ2Buffer != NULL);
+
+    // Initialize supersampling pipeline
+    MtFunction *kernelTileSS4 = mtNewFunctionWithName(library, "mandelbrot_compute_tile_ss4");
+    if (kernelTileSS4) {
+        pipelineTileSS4 = mtNewComputePipelineStateWithFunction(device, kernelTileSS4, NULL);
+        mtRelease(kernelTileSS4);
+    }
+
+    // Allocate smooth iteration buffer (one float per pixel for supersampled output)
+    size_t smoothIterSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(float);
+    smoothIterBuffer = mtDeviceNewBufferWithLength(device, smoothIterSize, MtResourceStorageModeShared);
+
+    supersampleInitialized = (pipelineTileSS4 != NULL && smoothIterBuffer != NULL);
+
     perturbMaxIter = max_iter;
     perturbInitialized = true;
 
@@ -791,6 +860,190 @@ void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
     mtRelease(cmdBuffer);
 }
 
+// =============================================================================
+// Smooth Coloring API Implementation
+// =============================================================================
+
+void gpu_compute_tile_smooth(const GPUTileParams *params,
+                             PixelColor *output,
+                             const MBRenderSettings *settings) {
+    if (!smoothInitialized || !pipelineTileSmooth) {
+        // Fallback to non-smooth
+        gpu_compute_tile(params, output);
+        return;
+    }
+
+    // Set tile parameters
+    TileParams *tileParams = mtBufferContents(tileParamsBuffer);
+    tileParams->center_x = params->center_x;
+    tileParams->center_y = params->center_y;
+    tileParams->scale = params->scale;
+    tileParams->tile_x = params->tile_x;
+    tileParams->tile_y = params->tile_y;
+    tileParams->tile_size = params->tile_size;
+    tileParams->max_iter = params->max_iter;
+    tileParams->vp_half_w = params->vp_half_w;
+    tileParams->vp_half_h = params->vp_half_h;
+
+    // Create command buffer and encoder
+    MtCommandBuffer *cmdBuffer = mtNewCommandBuffer(commandQueue);
+    mtRetain(cmdBuffer);
+    MtComputeCommandEncoder *encoder = mtNewComputeCommandEncoder(cmdBuffer);
+
+    mtComputeCommandEncoderSetComputePipelineState(encoder, pipelineTileSmooth);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, tileIterBuffer, 0, 0);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, tileParamsBuffer, 0, 1);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, finalZ2Buffer, 0, 2);
+
+    // Dispatch threads for tile (2D)
+    MtSize gridSize = {(NsUInteger)params->tile_size, (NsUInteger)params->tile_size, 1};
+    MtSize threadgroupSize = {16, 16, 1};
+    mtComputeCommandEncoderDispatchThread_threadsPerThreadgroup(encoder, gridSize, threadgroupSize);
+
+    mtComputeCommandEncoderEndEncoding(encoder);
+    mtCommandBufferCommit(cmdBuffer);
+    mtCommandBufferWaitUntilCompleted(cmdBuffer);
+
+    // Apply color mapping with smooth coloring
+    uint32_t *iterations = mtBufferContents(tileIterBuffer);
+    float *z2Values = mtBufferContents(finalZ2Buffer);
+    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
+
+    for (size_t i = 0; i < tilePixels; i++) {
+        color_from_iteration_ex(&output[i], iterations[i], z2Values[i],
+                                params->max_iter, settings);
+    }
+
+    mtRelease(cmdBuffer);
+}
+
+void gpu_compute_tile_perturb_v2_smooth(const GPUPerturbParamsV2 *params,
+                                        const double *deltas,
+                                        PixelColor *output,
+                                        uint32_t *iterations_out,
+                                        const MBRenderSettings *settings) {
+    if (!smoothInitialized || !pipelinePerturbV2Smooth) {
+        // Fallback to non-smooth
+        gpu_compute_tile_perturb_v2(params, deltas, output, iterations_out);
+        return;
+    }
+
+    // Copy deltas to GPU buffer
+    double *gpuDeltas = mtBufferContents(deltaBuffer);
+    size_t deltaCount = params->tile_size * params->tile_size * 2;
+    memcpy(gpuDeltas, deltas, deltaCount * sizeof(double));
+
+    // Set V2 parameters
+    PerturbParamsV2 *perturbParams = mtBufferContents(perturbParamsV2Buffer);
+    perturbParams->tile_size = params->tile_size;
+    perturbParams->max_iter = params->max_iter;
+    perturbParams->ref_escape_iter = params->ref_escape_iter;
+
+    // Create command buffer and encoder
+    MtCommandBuffer *cmdBuffer = mtNewCommandBuffer(commandQueue);
+    mtRetain(cmdBuffer);
+    MtComputeCommandEncoder *encoder = mtNewComputeCommandEncoder(cmdBuffer);
+
+    mtComputeCommandEncoderSetComputePipelineState(encoder, pipelinePerturbV2Smooth);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, perturbIterBuffer, 0, 0);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, perturbParamsV2Buffer, 0, 1);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, refOrbitBuffer, 0, 2);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, deltaBuffer, 0, 3);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, finalZ2Buffer, 0, 4);
+
+    // Dispatch threads for tile (2D)
+    MtSize gridSize = {(NsUInteger)params->tile_size, (NsUInteger)params->tile_size, 1};
+    MtSize threadgroupSize = {16, 16, 1};
+    mtComputeCommandEncoderDispatchThread_threadsPerThreadgroup(encoder, gridSize, threadgroupSize);
+
+    mtComputeCommandEncoderEndEncoding(encoder);
+    mtCommandBufferCommit(cmdBuffer);
+    mtCommandBufferWaitUntilCompleted(cmdBuffer);
+
+    // Get iteration results
+    uint32_t *iterations = mtBufferContents(perturbIterBuffer);
+    float *z2Values = mtBufferContents(finalZ2Buffer);
+    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
+
+    // Copy iterations if requested (for glitch handling)
+    if (iterations_out) {
+        memcpy(iterations_out, iterations, tilePixels * sizeof(uint32_t));
+    }
+
+    // Apply color mapping with smooth coloring
+    for (size_t i = 0; i < tilePixels; i++) {
+        uint32_t iter = iterations[i];
+        // Glitch marker pixels will be colored later after CPU fallback
+        if (iter == 0xFFFFFFFE) {
+#ifdef MB_DEBUG
+            output[i].r = 255;
+            output[i].g = 0;
+            output[i].b = 255;
+#else
+            output[i].r = 0;
+            output[i].g = 0;
+            output[i].b = 0;
+#endif
+        } else {
+            color_from_iteration_ex(&output[i], iter, z2Values[i],
+                                    params->max_iter, settings);
+        }
+    }
+
+    mtRelease(cmdBuffer);
+}
+
+void gpu_compute_tile_supersampled(const GPUTileParams *params,
+                                   PixelColor *output,
+                                   const MBRenderSettings *settings) {
+    if (!supersampleInitialized || !pipelineTileSS4) {
+        // Fallback to non-supersampled smooth
+        gpu_compute_tile_smooth(params, output, settings);
+        return;
+    }
+
+    // Set tile parameters
+    TileParams *tileParams = mtBufferContents(tileParamsBuffer);
+    tileParams->center_x = params->center_x;
+    tileParams->center_y = params->center_y;
+    tileParams->scale = params->scale;
+    tileParams->tile_x = params->tile_x;
+    tileParams->tile_y = params->tile_y;
+    tileParams->tile_size = params->tile_size;
+    tileParams->max_iter = params->max_iter;
+    tileParams->vp_half_w = params->vp_half_w;
+    tileParams->vp_half_h = params->vp_half_h;
+
+    // Create command buffer and encoder
+    MtCommandBuffer *cmdBuffer = mtNewCommandBuffer(commandQueue);
+    mtRetain(cmdBuffer);
+    MtComputeCommandEncoder *encoder = mtNewComputeCommandEncoder(cmdBuffer);
+
+    mtComputeCommandEncoderSetComputePipelineState(encoder, pipelineTileSS4);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, smoothIterBuffer, 0, 0);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, tileParamsBuffer, 0, 1);
+
+    // Dispatch threads for tile (2D)
+    MtSize gridSize = {(NsUInteger)params->tile_size, (NsUInteger)params->tile_size, 1};
+    MtSize threadgroupSize = {16, 16, 1};
+    mtComputeCommandEncoderDispatchThread_threadsPerThreadgroup(encoder, gridSize, threadgroupSize);
+
+    mtComputeCommandEncoderEndEncoding(encoder);
+    mtCommandBufferCommit(cmdBuffer);
+    mtCommandBufferWaitUntilCompleted(cmdBuffer);
+
+    // Apply color mapping from smooth iteration values
+    float *smoothIter = mtBufferContents(smoothIterBuffer);
+    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
+
+    for (size_t i = 0; i < tilePixels; i++) {
+        color_from_smooth_iteration(&output[i], smoothIter[i],
+                                    params->max_iter, settings->palette_id);
+    }
+
+    mtRelease(cmdBuffer);
+}
+
 #else // !MB_GPU_METAL
 
 #include <stdio.h>
@@ -888,6 +1141,34 @@ void gpu_precompute_deltas_hp(
     (void)tile_size; (void)vp_half_w; (void)vp_half_h;
     (void)tile_px; (void)tile_py;
     (void)delta_buffer;
+}
+
+void gpu_compute_tile_smooth(const GPUTileParams *params,
+                             PixelColor *output,
+                             const MBRenderSettings *settings) {
+    (void)params;
+    (void)output;
+    (void)settings;
+}
+
+void gpu_compute_tile_perturb_v2_smooth(const GPUPerturbParamsV2 *params,
+                                        const double *deltas,
+                                        PixelColor *output,
+                                        uint32_t *iterations,
+                                        const MBRenderSettings *settings) {
+    (void)params;
+    (void)deltas;
+    (void)output;
+    (void)iterations;
+    (void)settings;
+}
+
+void gpu_compute_tile_supersampled(const GPUTileParams *params,
+                                   PixelColor *output,
+                                   const MBRenderSettings *settings) {
+    (void)params;
+    (void)output;
+    (void)settings;
 }
 
 #endif // MB_GPU_METAL

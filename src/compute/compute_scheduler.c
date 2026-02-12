@@ -97,6 +97,8 @@ void scheduler_update_view(ComputeScheduler *sched, const MBViewState *view) {
 
         // Check if we need to upgrade precision
         if (required_prec > sched->current_precision) {
+            // Invalidate cache on precision tier change (128→256→512 bits)
+            tile_cache_new_generation(&sched->cache);
             // Reinitialize HP orbit with higher precision
             ref_orbit_hp_cleanup(&sched->ref_orbit_hp);
             ref_orbit_hp_init(&sched->ref_orbit_hp, MB_REF_ORBIT_MAX_ITER, required_prec);
@@ -272,6 +274,101 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
 
     // Store in cache
     tile_cache_put(&sched->cache, &key, output);
+
+    return true;
+}
+
+bool scheduler_get_tile_ex(ComputeScheduler *sched, const MBViewState *view,
+                           int tile_x, int tile_y, PixelColor *output,
+                           const MBRenderSettings *settings) {
+    // For non-smooth classic mode, use the cached path
+    if (settings->color_mode == MB_COLOR_MODE_CLASSIC &&
+        settings->palette_id == MB_PALETTE_CLASSIC) {
+        return scheduler_get_tile(sched, view, tile_x, tile_y, output);
+    }
+
+    // Smooth coloring or non-default palette - compute without caching
+    // (different render settings would need different cache entries)
+    double scale = mb_view_get_scale(view);
+    int vp_half_w = view->viewport_width / 2;
+    int vp_half_h = view->viewport_height / 2;
+
+    // Pixel offset for this tile
+    int px = tile_x * sched->tile_size;
+    int py = tile_y * sched->tile_size;
+
+    // Use perturbation V2 if enabled and reference is valid
+    if (sched->perturbation_enabled && sched->ref_orbit.valid) {
+        // Pre-compute deltas on CPU
+        if (sched->high_precision_mode && sched->ref_orbit_hp.valid) {
+            gpu_precompute_deltas_hp(
+                view->center_x_str, view->center_y_str,
+                sched->ref_orbit_hp.ref_cx_str, sched->ref_orbit_hp.ref_cy_str,
+                sched->current_precision, scale,
+                (uint32_t)sched->tile_size, vp_half_w, vp_half_h,
+                (uint32_t)px, (uint32_t)py, sched->delta_buffer);
+        } else {
+            gpu_precompute_deltas(view->center_x, view->center_y, scale,
+                                  sched->ref_orbit.ref_cx, sched->ref_orbit.ref_cy,
+                                  (uint32_t)sched->tile_size, vp_half_w, vp_half_h,
+                                  (uint32_t)px, (uint32_t)py, sched->delta_buffer);
+        }
+
+        GPUPerturbParamsV2 params = {
+            .tile_size = (uint32_t)sched->tile_size,
+            .max_iter = (uint32_t)sched->max_iter,
+            .ref_escape_iter = sched->ref_orbit.escape_iter
+        };
+
+        gpu_compute_tile_perturb_v2_smooth(&params, sched->delta_buffer,
+                                           output, sched->iter_buffer, settings);
+
+        // Handle glitched pixels with CPU fallback (with smooth support)
+        for (int ly = 0; ly < sched->tile_size; ly++) {
+            for (int lx = 0; lx < sched->tile_size; lx++) {
+                size_t idx = (size_t)ly * sched->tile_size + lx;
+                if (sched->iter_buffer[idx] == MB_GLITCH_MARKER) {
+                    double pixel_px = (double)(px + lx);
+                    double pixel_py = (double)(py + ly);
+                    double cx = view->center_x + (pixel_px - vp_half_w) * scale;
+                    double cy = view->center_y + (pixel_py - vp_half_h) * scale;
+
+                    float final_z2;
+                    unsigned int iteration = mb_compute_point_smooth(cx, cy, (unsigned int)sched->max_iter, &final_z2);
+                    color_from_iteration_ex(&output[idx], iteration, final_z2,
+                                            (unsigned int)sched->max_iter, settings);
+                }
+            }
+        }
+    } else if (!sched->gpu_available) {
+        // Use CPU double precision with smooth support
+        mb_compute_tile_double_smooth(
+            view->center_x, view->center_y, scale,
+            px, py, sched->tile_size,
+            vp_half_w, vp_half_h,
+            sched->max_iter, output, settings
+        );
+    } else {
+        // Use GPU float precision
+        GPUTileParams params = {
+            .center_x = (float)view->center_x,
+            .center_y = (float)view->center_y,
+            .scale = (float)scale,
+            .tile_x = (uint32_t)px,
+            .tile_y = (uint32_t)py,
+            .tile_size = (uint32_t)sched->tile_size,
+            .max_iter = (uint32_t)sched->max_iter,
+            .vp_half_w = (uint32_t)vp_half_w,
+            .vp_half_h = (uint32_t)vp_half_h
+        };
+        if (settings->antialiasing_enabled) {
+            // Use 2x2 supersampling
+            gpu_compute_tile_supersampled(&params, output, settings);
+        } else {
+            // Standard smooth coloring
+            gpu_compute_tile_smooth(&params, output, settings);
+        }
+    }
 
     return true;
 }

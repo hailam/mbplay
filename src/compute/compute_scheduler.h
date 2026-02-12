@@ -68,6 +68,20 @@ bool scheduler_get_tile(ComputeScheduler *sched, const MBViewState *view,
                         int tile_x, int tile_y, PixelColor *output);
 
 /**
+ * Request a tile with render settings (smooth coloring, palette).
+ * @param sched The scheduler
+ * @param view Current view state
+ * @param tile_x Tile X index (in tile units)
+ * @param tile_y Tile Y index (in tile units)
+ * @param output Output buffer (tile_size * tile_size pixels)
+ * @param settings Render settings (color mode, palette)
+ * @return true if tile was retrieved/computed, false on error
+ */
+bool scheduler_get_tile_ex(ComputeScheduler *sched, const MBViewState *view,
+                           int tile_x, int tile_y, PixelColor *output,
+                           const MBRenderSettings *settings);
+
+/**
  * Clean up scheduler resources.
  * @param sched The scheduler
  */

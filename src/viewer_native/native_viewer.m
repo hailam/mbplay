@@ -7,6 +7,7 @@
 #include "../tile_map/tile_map.h"
 #include "../tile_cache/disk_cache.h"
 #include "../color/color.h"
+#include "../color/palettes.h"
 #include "../mandelbrot/mandelbrot.h"
 #include <stdlib.h>
 #include <math.h>
@@ -105,6 +106,10 @@ static void handlePanDown(MandelbrotView *self);
 static void handlePanLeft(MandelbrotView *self);
 static void handlePanRight(MandelbrotView *self);
 static void handlePresetKey(MandelbrotView *self, unichar key);
+static void handleClearCache(MandelbrotView *self);
+static void handleCyclePalette(MandelbrotView *self);
+static void handleToggleSmoothColoring(MandelbrotView *self);
+static void handleToggleAntialiasing(MandelbrotView *self);
 
 // Static key bindings table (non-preset keys)
 static const KeyBinding kKeyBindings[] = {
@@ -116,6 +121,10 @@ static const KeyBinding kKeyBindings[] = {
     { 'c', 'C', handleToggleCoordinates,  NO  },
     { 'p', 'P', handleTogglePresetMenu,   NO  },
     { 27,  0,   handleEscape,             NO  },  // Escape key
+    { 'x', 'X', handleClearCache,         YES },  // Clear all caches
+    { 'n', 'N', handleCyclePalette,       YES },  // Cycle color palette
+    { 's', 'S', handleToggleSmoothColoring, YES }, // Toggle smooth coloring
+    { 'a', 'A', handleToggleAntialiasing, YES }, // Toggle antialiasing (MSAA)
 };
 static const int kKeyBindingsCount = sizeof(kKeyBindings) / sizeof(kKeyBindings[0]);
 
@@ -217,6 +226,9 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     // Preset menu
     BOOL _showPresetMenu;
     int _selectedPresetIdx;
+
+    // Render settings (smooth coloring, palette)
+    MBRenderSettings _renderSettings;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect;
@@ -340,6 +352,11 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         _mouseInView = NO;
         _mousePosition = NSMakePoint(0, 0);
         [self enableMouseTracking];
+
+        // Render settings defaults
+        _renderSettings.color_mode = MB_COLOR_MODE_CLASSIC;
+        _renderSettings.palette_id = MB_PALETTE_CLASSIC;
+        _renderSettings.antialiasing_enabled = false;
 
         // Set up display timer for 60fps (simpler than CVDisplayLink, avoids threading issues)
         _displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60.0
@@ -1344,6 +1361,41 @@ static void handlePanRight(MandelbrotView *self) {
     [self invalidateCache];
 }
 
+static void handleClearCache(MandelbrotView *self) {
+    // Clear in-memory tile cache
+    tile_cache_clear(&self->_scheduler.cache);
+    // Clear disk cache
+    if (self->_scheduler.disk_cache) {
+        disk_cache_clear(self->_scheduler.disk_cache);
+    }
+    self->_needsRedraw = YES;
+}
+
+static void handleCyclePalette(MandelbrotView *self) {
+    // Cycle to next palette
+    self->_renderSettings.palette_id = (self->_renderSettings.palette_id + 1) % MB_PALETTE_COUNT;
+    // Invalidate render cache since colors will change
+    [self invalidateRenderCache];
+}
+
+static void handleToggleSmoothColoring(MandelbrotView *self) {
+    // Toggle between classic and smooth coloring
+    if (self->_renderSettings.color_mode == MB_COLOR_MODE_CLASSIC) {
+        self->_renderSettings.color_mode = MB_COLOR_MODE_SMOOTH;
+    } else {
+        self->_renderSettings.color_mode = MB_COLOR_MODE_CLASSIC;
+    }
+    // Invalidate render cache since colors will change
+    [self invalidateRenderCache];
+}
+
+static void handleToggleAntialiasing(MandelbrotView *self) {
+    // Toggle antialiasing (2x2 supersampling)
+    self->_renderSettings.antialiasing_enabled = !self->_renderSettings.antialiasing_enabled;
+    // Invalidate render cache since rendering changes
+    [self invalidateRenderCache];
+}
+
 static void handlePresetKey(MandelbrotView *self, unichar key) {
     for (int i = 0; i < kPresetCount; i++) {
         if (kPresetLocations[i].key == key) {
@@ -1441,8 +1493,19 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
 
 - (void)invalidateCache {
     tile_cache_new_generation(&_scheduler.cache);
-    // Clear async tile cache (view changed, old tiles no longer valid for rendering)
-    // But we keep the computed tiles since they'll be saved to disk cache
+    _needsRedraw = YES;
+}
+
+- (void)invalidateRenderCache {
+    // Clear async tile cache (render settings changed)
+    [_asyncCacheLock lock];
+    [_asyncTileCache removeAllObjects];
+    [_pendingTiles removeAllObjects];
+    [_asyncCacheLock unlock];
+
+    // Also clear scheduler cache
+    tile_cache_new_generation(&_scheduler.cache);
+
     _needsRedraw = YES;
 }
 
@@ -1474,20 +1537,64 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     double scaleX = (double)srcSize / dstRect.size.width;
     double scaleY = (double)srcSize / dstRect.size.height;
 
+    // Use bilinear interpolation when upscaling (scale < 1.0)
+    BOOL useLinear = (scaleX < 1.0 || scaleY < 1.0);
+
     for (int dy = dy0; dy < dy1; dy++) {
         double sy = (dstRect.size.height - 1 - (dy - dstRect.origin.y)) * scaleY;
-        int syi = (int)sy;
-        if (syi >= srcSize) syi = srcSize - 1;
-        if (syi < 0) syi = 0;
 
         for (int dx = dx0; dx < dx1; dx++) {
             double sx = (dx - dstRect.origin.x) * scaleX;
-            int sxi = (int)sx;
-            if (sxi >= srcSize) sxi = srcSize - 1;
-            if (sxi < 0) sxi = 0;
 
-            _framebuffer[dy * _viewState.viewport_width + dx] =
-                src[syi * srcSize + sxi];
+            if (useLinear) {
+                // Bilinear interpolation
+                int sxi0 = (int)floor(sx);
+                int syi0 = (int)floor(sy);
+                int sxi1 = sxi0 + 1;
+                int syi1 = syi0 + 1;
+
+                // Clamp to valid range
+                if (sxi0 < 0) sxi0 = 0;
+                if (syi0 < 0) syi0 = 0;
+                if (sxi1 >= srcSize) sxi1 = srcSize - 1;
+                if (syi1 >= srcSize) syi1 = srcSize - 1;
+                if (sxi0 >= srcSize) sxi0 = srcSize - 1;
+                if (syi0 >= srcSize) syi0 = srcSize - 1;
+
+                // Fractional position
+                double fx = sx - floor(sx);
+                double fy = sy - floor(sy);
+
+                // Sample 4 neighbors
+                PixelColor p00 = src[syi0 * srcSize + sxi0];
+                PixelColor p10 = src[syi0 * srcSize + sxi1];
+                PixelColor p01 = src[syi1 * srcSize + sxi0];
+                PixelColor p11 = src[syi1 * srcSize + sxi1];
+
+                // Bilinear blend: (1-fx)(1-fy)*p00 + fx*(1-fy)*p10 + (1-fx)*fy*p01 + fx*fy*p11
+                double w00 = (1.0 - fx) * (1.0 - fy);
+                double w10 = fx * (1.0 - fy);
+                double w01 = (1.0 - fx) * fy;
+                double w11 = fx * fy;
+
+                PixelColor result;
+                result.r = (unsigned char)(w00 * p00.r + w10 * p10.r + w01 * p01.r + w11 * p11.r);
+                result.g = (unsigned char)(w00 * p00.g + w10 * p10.g + w01 * p01.g + w11 * p11.g);
+                result.b = (unsigned char)(w00 * p00.b + w10 * p10.b + w01 * p01.b + w11 * p11.b);
+
+                _framebuffer[dy * _viewState.viewport_width + dx] = result;
+            } else {
+                // Point sampling for downscaling
+                int sxi = (int)sx;
+                int syi = (int)sy;
+                if (sxi >= srcSize) sxi = srcSize - 1;
+                if (sxi < 0) sxi = 0;
+                if (syi >= srcSize) syi = srcSize - 1;
+                if (syi < 0) syi = 0;
+
+                _framebuffer[dy * _viewState.viewport_width + dx] =
+                    src[syi * srcSize + sxi];
+            }
         }
     }
 }
@@ -1521,6 +1628,9 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     [_pendingTiles addObject:key];
     [_asyncCacheLock unlock];
 
+    // Capture render settings by value for thread safety
+    MBRenderSettings capturedSettings = _renderSettings;
+
     // Queue async computation
     dispatch_async(_tileQueue, ^{
         // Allocate buffer for this tile
@@ -1545,8 +1655,10 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
             double cy = min_cy + (ly + 0.5) * scale_y;
             for (int lx = 0; lx < MB_MAP_TILE_SIZE; lx++) {
                 double cx = min_cx + (lx + 0.5) * scale_x;
-                unsigned int iteration = mb_compute_point(cx, cy, MAX_ITER);
-                color_from_iteration(&tileBuf[ly * MB_MAP_TILE_SIZE + lx], iteration);
+                float final_z2;
+                unsigned int iteration = mb_compute_point_smooth(cx, cy, MAX_ITER, &final_z2);
+                color_from_iteration_ex(&tileBuf[ly * MB_MAP_TILE_SIZE + lx],
+                                        iteration, final_z2, MAX_ITER, &capturedSettings);
             }
         }
 
@@ -1866,16 +1978,23 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
 
     NSString *tilesLine = [NSString stringWithFormat:@"Tiles: %lu cached, %lu pending",
                           (unsigned long)cachedCount, (unsigned long)pendingCount];
-    NSString *helpLine = @"Keys: I=HUD M=map C=coords P=presets 1-9=goto R=reset";
 
-    NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@\n%@",
-                        zoomLine, centerLine, scaleLine, precLine, tilesLine, helpLine];
+    // Render settings info
+    NSString *colorModeName = (_renderSettings.color_mode == MB_COLOR_MODE_SMOOTH) ? @"Smooth" : @"Classic";
+    NSString *paletteName = [NSString stringWithUTF8String:kPaletteNames[_renderSettings.palette_id]];
+    NSString *aaStatus = _renderSettings.antialiasing_enabled ? @"AA:ON" : @"AA:OFF";
+    NSString *renderLine = [NSString stringWithFormat:@"%@ | %@ | %@", colorModeName, paletteName, aaStatus];
+
+    NSString *helpLine = @"Keys: I=HUD S=smooth N=palette A=AA P=presets R=reset";
+
+    NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@\n%@\n%@",
+                        zoomLine, centerLine, scaleLine, precLine, tilesLine, renderLine, helpLine];
 
     // HUD dimensions
     int padding = 10;
     int lineHeight = 16;
     int hudWidth = 340;  // Wider for longer help line
-    int hudHeight = lineHeight * 6 + padding * 2;  // 6 lines
+    int hudHeight = lineHeight * 7 + padding * 2;  // 7 lines (added render settings)
 
     // Position in top-right corner
     int hudX = _viewState.viewport_width - hudWidth - padding;

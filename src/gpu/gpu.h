@@ -211,6 +211,53 @@ void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
                                   PixelColor *output, uint32_t *iterations);
 
 // =============================================================================
+// Smooth Coloring API
+// =============================================================================
+
+/**
+ * Compute a tile with smooth coloring support.
+ * Outputs both iteration counts and final |z|^2 values for smooth color mapping.
+ *
+ * @param params Tile parameters
+ * @param output Output pixel buffer
+ * @param settings Render settings (color mode, palette)
+ */
+void gpu_compute_tile_smooth(const GPUTileParams *params,
+                             PixelColor *output,
+                             const MBRenderSettings *settings);
+
+/**
+ * Compute a tile using perturbation V2 with smooth coloring.
+ *
+ * @param params V2 tile parameters
+ * @param deltas Pre-computed delta buffer
+ * @param output Output pixel buffer
+ * @param iterations Optional: raw iteration output
+ * @param settings Render settings
+ */
+void gpu_compute_tile_perturb_v2_smooth(const GPUPerturbParamsV2 *params,
+                                        const double *deltas,
+                                        PixelColor *output,
+                                        uint32_t *iterations,
+                                        const MBRenderSettings *settings);
+
+// =============================================================================
+// Supersampling (MSAA) API
+// =============================================================================
+
+/**
+ * Compute a tile with 2x2 supersampling (4 samples per pixel).
+ * This provides anti-aliased output with smooth coloring.
+ *
+ * @param params Tile parameters
+ * @param output Output pixel buffer
+ * @param settings Render settings (palette is used for color mapping)
+ */
+void gpu_compute_tile_supersampled(const GPUTileParams *params,
+                                   PixelColor *output,
+                                   const MBRenderSettings *settings);
+
+// =============================================================================
 // High-Precision Delta Computation API
 // =============================================================================
 

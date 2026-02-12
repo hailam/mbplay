@@ -124,6 +124,33 @@ typedef struct {
 #define MB_MAX_CACHED_TILES 256
 
 // =============================================================================
+// Rendering Mode Configuration
+// =============================================================================
+
+// Coloring modes
+typedef enum {
+    MB_COLOR_MODE_CLASSIC = 0,  // Integer iteration (classic banding)
+    MB_COLOR_MODE_SMOOTH = 1    // Smooth coloring using log2(log2(|z|))
+} MBColorMode;
+
+// Available palettes
+typedef enum {
+    MB_PALETTE_CLASSIC = 0,     // Original bit-mixing palette
+    MB_PALETTE_FIRE = 1,        // Black → Red → Orange → Yellow → White
+    MB_PALETTE_OCEAN = 2,       // Deep blue → Cyan → White
+    MB_PALETTE_PLASMA = 3,      // Purple → Pink → Orange (cosine)
+    MB_PALETTE_GRAYSCALE = 4,   // For analysis/export
+    MB_PALETTE_COUNT = 5
+} MBPaletteId;
+
+// Rendering state
+typedef struct {
+    MBColorMode color_mode;
+    MBPaletteId palette_id;
+    bool antialiasing_enabled;   // 2x2 supersampling
+} MBRenderSettings;
+
+// =============================================================================
 // Interactive Viewer State
 // =============================================================================
 

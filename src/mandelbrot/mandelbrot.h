@@ -75,4 +75,41 @@ void mb_compute_tile_double(double center_x, double center_y, double scale,
                             int vp_half_w, int vp_half_h,
                             int max_iter, PixelColor *output);
 
+// =============================================================================
+// Smooth Coloring Support
+// =============================================================================
+
+/**
+ * Compute iteration count and final |z|^2 for smooth coloring.
+ *
+ * @param cx Real part of complex coordinate
+ * @param cy Imaginary part of complex coordinate
+ * @param max_iter Maximum iterations
+ * @param final_z2 Output: final |z|^2 at escape (for smooth coloring)
+ * @return Number of iterations before escape
+ */
+unsigned int mb_compute_point_smooth(double cx, double cy, unsigned int max_iter,
+                                     float *final_z2);
+
+/**
+ * Compute a tile using double precision with smooth coloring support.
+ *
+ * @param center_x View center X in complex plane
+ * @param center_y View center Y in complex plane
+ * @param scale Complex units per pixel
+ * @param tile_x Tile X offset in pixels
+ * @param tile_y Tile Y offset in pixels
+ * @param tile_size Tile dimension
+ * @param vp_half_w Half viewport width
+ * @param vp_half_h Half viewport height
+ * @param max_iter Maximum iterations
+ * @param output Output buffer (tile_size * tile_size pixels)
+ * @param settings Render settings (color mode, palette)
+ */
+void mb_compute_tile_double_smooth(double center_x, double center_y, double scale,
+                                   int tile_x, int tile_y, int tile_size,
+                                   int vp_half_w, int vp_half_h,
+                                   int max_iter, PixelColor *output,
+                                   const MBRenderSettings *settings);
+
 #endif // MB_MANDELBROT_H

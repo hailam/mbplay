@@ -105,6 +105,40 @@ kernel void mandelbrot_compute_tile(
     iterations[gid.y * params.tile_size + gid.x] = iteration;
 }
 
+// Tile computation with final |z|^2 output for smooth coloring
+kernel void mandelbrot_compute_tile_smooth(
+    device uint *iterations [[buffer(0)]],
+    device float *final_z2 [[buffer(2)]],
+    constant TileParams &params [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.tile_size || gid.y >= params.tile_size) return;
+    float px = float(params.tile_x + gid.x);
+    float py = float(params.tile_y + gid.y);
+    float cx = params.center_x + (px - float(params.vp_half_w)) * params.scale;
+    float cy = params.center_y + (py - float(params.vp_half_h)) * params.scale;
+
+    uint idx = gid.y * params.tile_size + gid.x;
+    uint iteration = params.max_iter;
+    float z2 = 0.0f;
+
+    if (!is_in_cardioid_or_bulb(cx, cy)) {
+        float zx = 0.0f, zy = 0.0f, zx2 = 0.0f, zy2 = 0.0f;
+        iteration = 0;
+        while (zx2 + zy2 < 4.0f && iteration < params.max_iter) {
+            zy = 2.0f * zx * zy + cy;
+            zx = zx2 - zy2 + cx;
+            zx2 = zx * zx;
+            zy2 = zy * zy;
+            iteration++;
+        }
+        z2 = zx2 + zy2;
+    }
+
+    iterations[idx] = iteration;
+    final_z2[idx] = z2;
+}
+
 struct PerturbParams {
     float center_x, center_y, scale;
     float ref_cx, ref_cy;
@@ -219,4 +253,135 @@ kernel void mandelbrot_compute_perturb_v2(
     }
 
     iterations[idx] = iteration;
+}
+
+// =============================================================================
+// Supersampled Kernels (2x2 MSAA)
+// =============================================================================
+
+// Helper function to compute smooth iteration for a single point
+static float compute_smooth_iter(float cx, float cy, uint max_iter) {
+    if (is_in_cardioid_or_bulb(cx, cy)) {
+        return float(max_iter);
+    }
+
+    float zx = 0.0f, zy = 0.0f, zx2 = 0.0f, zy2 = 0.0f;
+    uint iteration = 0;
+
+    while (zx2 + zy2 < 4.0f && iteration < max_iter) {
+        zy = 2.0f * zx * zy + cy;
+        zx = zx2 - zy2 + cx;
+        zx2 = zx * zx;
+        zy2 = zy * zy;
+        iteration++;
+    }
+
+    // Compute smooth iteration
+    if (iteration >= max_iter) {
+        return float(max_iter);
+    }
+
+    float z2 = zx2 + zy2;
+    if (z2 <= 4.0f) {
+        return float(iteration);
+    }
+
+    // smooth = iter + 1 - log2(log(z2) / log(4)) = iter + 1 - log2(log(z2)) + 1
+    float log_z2 = log(z2);
+    float log_log_z = log(log_z2 * 0.5f);
+    float log2_log_z = log_log_z / 0.693147f;
+
+    return float(iteration) + 1.0f - log2_log_z;
+}
+
+// 2x2 supersampled tile computation with smooth output
+kernel void mandelbrot_compute_tile_ss4(
+    device float *smooth_iter [[buffer(0)]],
+    constant TileParams &params [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.tile_size || gid.y >= params.tile_size) return;
+
+    // 2x2 jittered sample offsets (rotated grid pattern)
+    const float offsets[4][2] = {
+        {-0.375f, -0.125f},
+        { 0.125f, -0.375f},
+        {-0.125f,  0.375f},
+        { 0.375f,  0.125f}
+    };
+
+    float px = float(params.tile_x + gid.x);
+    float py = float(params.tile_y + gid.y);
+    float base_cx = params.center_x + (px - float(params.vp_half_w)) * params.scale;
+    float base_cy = params.center_y + (py - float(params.vp_half_h)) * params.scale;
+
+    float sum = 0.0f;
+    for (int s = 0; s < 4; s++) {
+        float cx = base_cx + offsets[s][0] * params.scale;
+        float cy = base_cy + offsets[s][1] * params.scale;
+        sum += compute_smooth_iter(cx, cy, params.max_iter);
+    }
+
+    smooth_iter[gid.y * params.tile_size + gid.x] = sum / 4.0f;
+}
+
+// Perturbation V2 with smooth coloring support (outputs final |z|^2)
+kernel void mandelbrot_compute_perturb_v2_smooth(
+    device uint *iterations [[buffer(0)]],
+    device float *final_z2 [[buffer(4)]],
+    constant PerturbParamsV2 &params [[buffer(1)]],
+    constant double2 *ref_orbit [[buffer(2)]],
+    constant double2 *pixel_deltas [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= params.tile_size || gid.y >= params.tile_size) return;
+
+    uint idx = gid.y * params.tile_size + gid.x;
+    double2 delta_c = pixel_deltas[idx];  // Pre-computed on CPU in double precision!
+
+    double delta_x = 0.0, delta_y = 0.0;
+    uint iteration = 0;
+    uint max_safe = min(params.max_iter, params.ref_escape_iter);
+    float z2 = 0.0f;
+
+    while (iteration < max_safe) {
+        double2 z_ref = ref_orbit[iteration];
+        double zx = z_ref.x + delta_x;
+        double zy = z_ref.y + delta_y;
+
+        double mag = zx*zx + zy*zy;
+        if (mag >= 4.0) {
+            z2 = float(mag);
+            break;
+        }
+
+        // d_n+1 = 2*Z_ref*d + d^2 + dC
+        double new_dx = 2.0*(z_ref.x*delta_x - z_ref.y*delta_y)
+                     + delta_x*delta_x - delta_y*delta_y + delta_c.x;
+        double new_dy = 2.0*(z_ref.x*delta_y + z_ref.y*delta_x)
+                     + 2.0*delta_x*delta_y + delta_c.y;
+
+        // Glitch detection: delta magnitude too large relative to reference
+        double delta_mag = new_dx*new_dx + new_dy*new_dy;
+        double ref_mag = z_ref.x*z_ref.x + z_ref.y*z_ref.y;
+        if (delta_mag > ref_mag * 1e6 && ref_mag > 1e-10) {
+            iterations[idx] = 0xFFFFFFFE;
+            final_z2[idx] = 0.0f;
+            return;
+        }
+
+        delta_x = new_dx;
+        delta_y = new_dy;
+        iteration++;
+    }
+
+    // Mark glitch if pixel needs more iterations than reference
+    if (iteration >= params.ref_escape_iter && iteration < params.max_iter) {
+        iterations[idx] = 0xFFFFFFFE;
+        final_z2[idx] = 0.0f;
+        return;
+    }
+
+    iterations[idx] = iteration;
+    final_z2[idx] = z2;
 }

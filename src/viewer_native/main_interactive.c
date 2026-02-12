@@ -27,6 +27,7 @@ int main(int argc, char *argv[]) {
     printf("  +/-: Zoom in/out\n");
     printf("  Arrow keys: Pan\n");
     printf("  R: Reset view\n");
+    printf("  X: Clear all caches\n");
     printf("  Esc: Quit\n");
     printf("\n");
 
