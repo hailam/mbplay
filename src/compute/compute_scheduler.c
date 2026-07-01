@@ -44,23 +44,19 @@ int scheduler_init(ComputeScheduler *sched, int tile_size, int max_iter) {
         return -1;
     }
 
-    // Try to initialize GPU
+    // Try to initialize GPU (float tile kernels for shallow zoom)
     sched->gpu_available = (gpu_init_tiles(tile_size, max_iter) == 0);
 
-    // Initialize perturbation if GPU is available
-    if (sched->gpu_available) {
-        if (ref_orbit_init(&sched->ref_orbit, MB_REF_ORBIT_MAX_ITER) == 0) {
-            if (gpu_init_perturbation(MB_REF_ORBIT_MAX_ITER) == 0) {
-                sched->perturbation_enabled = true;
-            }
-        }
-
-        // Initialize HP reference orbit with default precision
-        // It will be re-initialized with higher precision as needed
-        if (ref_orbit_hp_init(&sched->ref_orbit_hp, MB_REF_ORBIT_MAX_ITER, MB_PREC_TIER_1) == 0) {
-            // HP orbit initialized successfully
+    // Perturbation iteration runs on the CPU and needs no GPU.
+    if (ref_orbit_init(&sched->ref_orbit, MB_REF_ORBIT_MAX_ITER) == 0) {
+        if (gpu_init_perturbation(MB_REF_ORBIT_MAX_ITER) == 0) {
+            sched->perturbation_enabled = true;
         }
     }
+
+    // Initialize HP reference orbit with default precision;
+    // it is re-initialized with higher precision as needed.
+    ref_orbit_hp_init(&sched->ref_orbit_hp, MB_REF_ORBIT_MAX_ITER, MB_PREC_TIER_1);
 
     return 0;
 }
@@ -186,7 +182,8 @@ static void handle_glitches(ComputeScheduler *sched, const MBViewState *view,
                 double cy = view->center_y + (py - vp_half_h) * scale;
 
                 unsigned int iteration = mb_compute_point(cx, cy, (unsigned int)sched->max_iter);
-                color_from_iteration(&output[idx], iteration);
+                color_from_iteration_classic(&output[idx], iteration,
+                                             (unsigned int)sched->max_iter);
             }
         }
     }

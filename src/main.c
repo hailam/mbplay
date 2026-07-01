@@ -20,7 +20,7 @@ static void cpu_compute_row(const MBConfig *cfg, int y, PixelColor *output) {
     for (int x = 0; x < cfg->width; x++) {
         double cx = (x - cfg->width_half) * cfg->cx_scale;
         unsigned int iteration = mb_compute_point(cx, cy, (unsigned int)cfg->max_iter);
-        color_from_iteration(&output[x], iteration);
+        color_from_iteration_classic(&output[x], iteration, (unsigned int)cfg->max_iter);
     }
 }
 
@@ -161,8 +161,9 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Progress indicator
-        int progress = (y * 100) / height;
+        // Progress indicator (64-bit product: y*100 can overflow int for
+        // very tall images)
+        int progress = (int)(((int64_t)y * 100) / height);
         if (progress != last_progress && progress % 10 == 0) {
             printf("  %d%%\n", progress);
             last_progress = progress;

@@ -3,14 +3,26 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <CoreText/CoreText.h>
 #include "native_viewer.h"
+#include "control_panel.h"
+#include "overlay_zoom_slider.h"
+#include "coordinate_marker.h"
 #include "../compute/compute_scheduler.h"
 #include "../tile_map/tile_map.h"
 #include "../tile_cache/disk_cache.h"
 #include "../color/color.h"
 #include "../color/palettes.h"
 #include "../mandelbrot/mandelbrot.h"
+#include "../perturbation/deep_render.h"
+#include "../precision/view_hp.h"
+#include "../precision/mp_real.h"
 #include <stdlib.h>
 #include <math.h>
+#include <stdatomic.h>
+
+// How long the view must be stable before deep tiles are computed. While the
+// user is actively zooming/panning, only the cheap reprojected placeholder is
+// drawn; expensive perturbation tiles start once they stop.
+#define MB_DEEP_SETTLE_SECONDS 0.15
 
 // =============================================================================
 // Debug Logging (disabled in release builds)
@@ -110,6 +122,10 @@ static void handleClearCache(MandelbrotView *self);
 static void handleCyclePalette(MandelbrotView *self);
 static void handleToggleSmoothColoring(MandelbrotView *self);
 static void handleToggleAntialiasing(MandelbrotView *self);
+static void handleDecreaseColorCycleScale(MandelbrotView *self);
+static void handleIncreaseColorCycleScale(MandelbrotView *self);
+static void handleToggleControlPanel(MandelbrotView *self);
+static void handleToggleCoordinatePicker(MandelbrotView *self);
 
 // Static key bindings table (non-preset keys)
 static const KeyBinding kKeyBindings[] = {
@@ -125,6 +141,10 @@ static const KeyBinding kKeyBindings[] = {
     { 'n', 'N', handleCyclePalette,       YES },  // Cycle color palette
     { 's', 'S', handleToggleSmoothColoring, YES }, // Toggle smooth coloring
     { 'a', 'A', handleToggleAntialiasing, YES }, // Toggle antialiasing (MSAA)
+    { '[', '{', handleDecreaseColorCycleScale, YES }, // More color bands (tighter cycling)
+    { ']', '}', handleIncreaseColorCycleScale, YES }, // Fewer color bands (smoother)
+    { '\t', 0, handleToggleControlPanel, NO }, // Tab: Toggle control panel
+    { 'g', 'G', handleToggleCoordinatePicker, NO }, // G: Toggle coordinate picker
 };
 static const int kKeyBindingsCount = sizeof(kKeyBindings) / sizeof(kKeyBindings[0]);
 
@@ -160,7 +180,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 // MandelbrotView - Custom NSView with Metal rendering
 // =============================================================================
 
-@interface MandelbrotView : NSView {
+@interface MandelbrotView : NSView <MBControlPanelDelegate, MBZoomSliderOverlayDelegate, MBCoordinateMarkerDelegate> {
     CAMetalLayer *_metalLayer;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commandQueue;
@@ -229,11 +249,42 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 
     // Render settings (smooth coloring, palette)
     MBRenderSettings _renderSettings;
+
+    // Control panel reference (not retained - managed externally)
+    MBControlPanel *_controlPanel;
+
+    // Overlay controls
+    MBZoomSliderOverlay *_zoomSlider;
+    MBCoordinateMarker *_coordinateMarker;
+
+    // Deep-zoom rendering (screen-space perturbation tiles)
+    MBDeepRenderer *_deepRenderer;
+    // Bumped on every view change (main thread); read by tile workers to
+    // drop queued jobs whose view is already gone.
+    _Atomic(uint64_t) _viewGeneration;
+    // Last time the view changed; tile queuing waits for the view to settle
+    // so rapid zooming does not compute tiles the user immediately discards.
+    CFAbsoluteTime _lastViewChangeTime;
+    BOOL _deepNeedsPoll;            // re-render while waiting for settle
+    // Current map-tile pyramid level; map workers skip tiles queued for a
+    // level far from what is being displayed now.
+    _Atomic(int) _currentTargetZoom;
+
+    // Last fully rendered deep frame, reprojected as a placeholder while
+    // tiles of the current generation are still computing.
+    PixelColor *_lastDeepFrame;
+    int _lastDeepFrameW, _lastDeepFrameH;
+    MBViewState _lastDeepFrameView;
+    BOOL _lastDeepFrameValid;
 }
 
 - (instancetype)initWithFrame:(NSRect)frameRect;
 - (void)invalidate;
 - (MBViewState *)viewState;
+- (void)loadRenderSettings;
+- (void)saveRenderSettings;
+- (void)setControlPanel:(MBControlPanel *)panel;
+- (void)syncControlPanel;
 
 @end
 
@@ -353,10 +404,35 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         _mousePosition = NSMakePoint(0, 0);
         [self enableMouseTracking];
 
-        // Render settings defaults
-        _renderSettings.color_mode = MB_COLOR_MODE_CLASSIC;
-        _renderSettings.palette_id = MB_PALETTE_CLASSIC;
-        _renderSettings.antialiasing_enabled = false;
+        // Create zoom slider overlay (right edge, vertically centered)
+        CGFloat sliderY = (frameRect.size.height - MB_ZOOM_SLIDER_HEIGHT) / 2;
+        NSRect sliderFrame = NSMakeRect(
+            frameRect.size.width - MB_ZOOM_SLIDER_WIDTH - MB_ZOOM_SLIDER_MARGIN,
+            sliderY,
+            MB_ZOOM_SLIDER_WIDTH,
+            MB_ZOOM_SLIDER_HEIGHT);
+        _zoomSlider = [[MBZoomSliderOverlay alloc] initWithFrame:sliderFrame];
+        _zoomSlider.delegate = self;
+        _zoomSlider.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin | NSViewMaxYMargin;
+        [self addSubview:_zoomSlider];
+
+        // Create coordinate marker overlay (covers entire view)
+        _coordinateMarker = [[MBCoordinateMarker alloc] initWithFrame:self.bounds];
+        _coordinateMarker.delegate = self;
+        _coordinateMarker.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [self addSubview:_coordinateMarker];
+
+        // Deep-zoom renderer (screen-space perturbation tiles)
+        _deepRenderer = mb_deep_renderer_create();
+        _viewGeneration = 1;
+        _lastDeepFrame = NULL;
+        _lastDeepFrameValid = NO;
+
+        // Load render settings from user defaults or use defaults
+        [self loadRenderSettings];
+
+        // Disk tiles are stored post-colored; key them by the settings
+        [self updateDiskCacheVariant];
 
         // Set up display timer for 60fps (simpler than CVDisplayLink, avoids threading issues)
         _displayTimer = [NSTimer scheduledTimerWithTimeInterval:1.0/60.0
@@ -369,6 +445,175 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         [[NSRunLoop currentRunLoop] addTimer:_displayTimer forMode:NSEventTrackingRunLoopMode];
     }
     return self;
+}
+
+- (void)loadRenderSettings {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    // Check if settings exist (first run detection)
+    if ([defaults objectForKey:@"mb_color_mode"]) {
+        _renderSettings.color_mode = (MBColorMode)[defaults integerForKey:@"mb_color_mode"];
+        _renderSettings.palette_id = (MBPaletteId)[defaults integerForKey:@"mb_palette_id"];
+        _renderSettings.antialiasing_enabled = [defaults boolForKey:@"mb_antialiasing"];
+        _renderSettings.color_cycle_scale = [defaults floatForKey:@"mb_color_cycle_scale"];
+
+        // Validate palette_id in case app was downgraded
+        if (_renderSettings.palette_id >= MB_PALETTE_COUNT) {
+            _renderSettings.palette_id = MB_PALETTE_CLASSIC;
+        }
+        // Validate color_cycle_scale range
+        if (_renderSettings.color_cycle_scale < 8.0f || _renderSettings.color_cycle_scale > 512.0f) {
+            _renderSettings.color_cycle_scale = 64.0f;
+        }
+    } else {
+        // First run defaults
+        _renderSettings.color_mode = MB_COLOR_MODE_CLASSIC;
+        _renderSettings.palette_id = MB_PALETTE_CLASSIC;
+        _renderSettings.antialiasing_enabled = NO;
+        _renderSettings.color_cycle_scale = 64.0f;
+    }
+}
+
+- (void)saveRenderSettings {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    [defaults setInteger:_renderSettings.color_mode forKey:@"mb_color_mode"];
+    [defaults setInteger:_renderSettings.palette_id forKey:@"mb_palette_id"];
+    [defaults setBool:_renderSettings.antialiasing_enabled forKey:@"mb_antialiasing"];
+    [defaults setFloat:_renderSettings.color_cycle_scale forKey:@"mb_color_cycle_scale"];
+}
+
+// =============================================================================
+// Control Panel Integration
+// =============================================================================
+
+- (void)setControlPanel:(MBControlPanel *)panel {
+    _controlPanel = panel;
+    panel.delegate = self;
+    [self syncControlPanel];
+}
+
+- (void)syncControlPanel {
+    if (_controlPanel) {
+        [_controlPanel updateCoordinatesFromViewState:&_viewState];
+        [_controlPanel updateZoomDisplay:_viewState.zoom_level];
+        [_controlPanel setAnimationSpeed:_animDuration];
+        [_controlPanel setColorCycleScale:_renderSettings.color_cycle_scale];
+    }
+
+    // Also update overlay controls
+    if (_zoomSlider) {
+        [_zoomSlider updateZoomLevel:_viewState.zoom_level];
+    }
+    if (_coordinateMarker) {
+        [_coordinateMarker updateViewState:&_viewState];
+    }
+}
+
+// =============================================================================
+// MBControlPanelDelegate Protocol
+// =============================================================================
+
+- (void)controlPanel:(MBControlPanel *)panel didRequestJumpToRealString:(NSString *)realStr
+          imagString:(NSString *)imagStr {
+    (void)panel;
+
+    // Always set the center from the raw strings in MPFR: a user may paste a
+    // deep target while still zoomed out and zoom in afterwards, so the full
+    // precision must be captured regardless of the current zoom. (Jumps do
+    // not animate — the double-based animation path would truncate it.)
+    if (mb_view_hp_set_center(&_viewState,
+                              realStr.UTF8String, imagStr.UTF8String) == 0) {
+        [self updateHPMode];
+        [self invalidateCache];
+        [self syncControlPanel];
+    } else {
+        NSBeep();
+    }
+}
+
+- (void)controlPanel:(MBControlPanel *)panel didChangeAnimationSpeed:(double)seconds {
+    (void)panel;
+    _animDuration = seconds;
+}
+
+- (void)controlPanel:(MBControlPanel *)panel didChangeColorCycleScale:(float)scale {
+    (void)panel;
+    _renderSettings.color_cycle_scale = scale;
+    [self invalidateRenderCache];
+    [self saveRenderSettings];
+}
+
+- (void)controlPanelDidRequestCopyCoordinates:(MBControlPanel *)panel {
+    (void)panel;
+
+    // Format coordinates as "real + imag*i" or "real - abs(imag)*i".
+    // In HP mode the strings carry the full precision.
+    NSString *coordStr;
+    if (_viewState.high_precision_mode) {
+        NSString *re = [NSString stringWithUTF8String:_viewState.center_x_str];
+        NSString *im = [NSString stringWithUTF8String:_viewState.center_y_str];
+        if ([im hasPrefix:@"-"]) {
+            coordStr = [NSString stringWithFormat:@"%@ - %@i", re, [im substringFromIndex:1]];
+        } else {
+            coordStr = [NSString stringWithFormat:@"%@ + %@i", re, im];
+        }
+    } else if (_viewState.center_y >= 0) {
+        coordStr = [NSString stringWithFormat:@"%.17g + %.17gi",
+                    _viewState.center_x, _viewState.center_y];
+    } else {
+        coordStr = [NSString stringWithFormat:@"%.17g - %.17gi",
+                    _viewState.center_x, -_viewState.center_y];
+    }
+
+    // Copy to clipboard
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    [pb clearContents];
+    [pb setString:coordStr forType:NSPasteboardTypeString];
+}
+
+// =============================================================================
+// MBZoomSliderOverlayDelegate Protocol
+// =============================================================================
+
+- (void)zoomSliderOverlay:(MBZoomSliderOverlay *)slider didChangeZoomLevel:(double)zoomLevel {
+    (void)slider;
+    // Animate to the new zoom level, keeping center position
+    [self startAnimationToX:_viewState.center_x y:_viewState.center_y zoom:zoomLevel];
+}
+
+- (void)zoomSliderOverlay:(MBZoomSliderOverlay *)slider didScrollWithDelta:(CGFloat)delta {
+    (void)slider;
+    // Fine zoom adjustment via scroll wheel on slider. Clamp the per-event
+    // factor: a momentum flick can otherwise drive it to zero or negative,
+    // teleporting the view to the zoom clamp boundary.
+    double factor = 1.0 + delta * MB_SCROLL_SENSITIVITY;
+    if (factor < 0.2) factor = 0.2;
+    if (factor > 5.0) factor = 5.0;
+    double newZoom = mb_clamp_zoom(_viewState.zoom_level * factor);
+    [self startAnimationToX:_viewState.center_x y:_viewState.center_y zoom:newZoom];
+}
+
+// =============================================================================
+// MBCoordinateMarkerDelegate Protocol
+// =============================================================================
+
+- (void)coordinateMarker:(MBCoordinateMarker *)marker didMoveToReal:(double)real imag:(double)imag {
+    (void)marker;
+    // Update control panel text fields to show marker coordinates
+    if (_controlPanel) {
+        [_controlPanel setCoordinateReal:real imag:imag];
+    }
+}
+
+- (void)coordinateMarkerDidRequestNavigation:(MBCoordinateMarker *)marker {
+    // Navigate to marker position, keeping current zoom
+    [self startAnimationToX:marker.coordinateReal y:marker.coordinateImag zoom:_viewState.zoom_level];
+}
+
+- (void)coordinateMarker:(MBCoordinateMarker *)marker pickerModeChanged:(BOOL)active {
+    (void)marker;
+    (void)active;
+    // Could update UI to indicate picker mode is active
+    _needsRedraw = YES;
 }
 
 - (void)dealloc {
@@ -432,6 +677,22 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         [_asyncCacheLock release];
         _asyncCacheLock = nil;
     }
+    if (_zoomSlider) {
+        [_zoomSlider release];
+        _zoomSlider = nil;
+    }
+    if (_coordinateMarker) {
+        [_coordinateMarker release];
+        _coordinateMarker = nil;
+    }
+    if (_deepRenderer) {
+        mb_deep_renderer_destroy(_deepRenderer);
+        _deepRenderer = NULL;
+    }
+    if (_lastDeepFrame) {
+        free(_lastDeepFrame);
+        _lastDeepFrame = NULL;
+    }
     [super dealloc];
 }
 
@@ -446,6 +707,9 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
+
+    int oldWidth = _viewState.viewport_width;
+    int oldHeight = _viewState.viewport_height;
 
     // Update viewport
     _viewState.viewport_width = (int)newSize.width;
@@ -462,16 +726,22 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     if (newBuf) {
         _framebuffer = newBuf;
     } else {
-        // Realloc failed - keep old buffer and restore dimensions
+        // Realloc failed — the framebuffer still has the old size, so the
+        // viewport dimensions must be restored or the render loop would
+        // write past the end of the old allocation.
+        _viewState.viewport_width = oldWidth;
+        _viewState.viewport_height = oldHeight;
         return;
     }
 
     // Resize texture
     [self createTexture];
 
-    // Invalidate cache on resize
-    tile_cache_new_generation(&_scheduler.cache);
-    _needsRedraw = YES;
+    // Invalidate caches on resize. Deep tiles bake the viewport geometry
+    // into their pixels (deltas are relative to the viewport center), so the
+    // view generation must advance or stale tiles would be blitted with the
+    // wrong mapping.
+    [self invalidateCache];
 }
 
 - (void)createTexture {
@@ -521,28 +791,11 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 - (void)updateHPMode {
     BOOL needsHP = _viewState.zoom_level >= MB_HP_ZOOM_THRESHOLD;
 
-    if (needsHP != _highPrecisionMode) {
-        _highPrecisionMode = needsHP;
-        _viewState.high_precision_mode = needsHP;
-
-        if (needsHP) {
-            // Calculate precision tier
-            double log_zoom = log10(_viewState.zoom_level);
-            if (log_zoom < 30) _currentPrecision = MB_PREC_TIER_1;
-            else if (log_zoom < 60) _currentPrecision = MB_PREC_TIER_2;
-            else if (log_zoom < 120) _currentPrecision = MB_PREC_TIER_3;
-            else _currentPrecision = MB_PREC_TIER_4;
-        } else {
-            _currentPrecision = 64;
-        }
-    }
-}
-
-- (void)syncHPCenterStrings {
-    // Sync HP center strings from double values
-    // This is used when transitioning into HP mode or after pan operations
-    snprintf(_viewState.center_x_str, MB_HP_COORD_STR_LEN, "%.17g", _viewState.center_x);
-    snprintf(_viewState.center_y_str, MB_HP_COORD_STR_LEN, "%.17g", _viewState.center_y);
+    _highPrecisionMode = needsHP;
+    _viewState.high_precision_mode = needsHP;
+    _currentPrecision = needsHP
+        ? (uint32_t)mp_required_precision(_viewState.zoom_level)
+        : 64;
 }
 
 // =============================================================================
@@ -554,6 +807,28 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 }
 
 - (void)startAnimationToX:(double)x y:(double)y zoom:(double)zoom {
+    zoom = mb_clamp_zoom(zoom);
+
+    // Deep zoom: jump directly. The animation interpolates the center in
+    // double precision, which would truncate an HP center; and when only the
+    // zoom changes we must not touch the center strings at all.
+    if (_viewState.zoom_level >= MB_DEEP_ZOOM_THRESHOLD || zoom >= MB_DEEP_ZOOM_THRESHOLD) {
+        BOOL centerChanged = (x != _viewState.center_x || y != _viewState.center_y);
+        _viewState.zoom_level = zoom;
+        if (centerChanged) {
+            // Target is given as doubles (marker/preset); precision is
+            // limited to double by the caller anyway.
+            _viewState.center_x = x;
+            _viewState.center_y = y;
+            mb_view_hp_sync_from_doubles(&_viewState);
+        }
+        _animating = NO;
+        [self updateHPMode];
+        [self invalidateCache];
+        [self syncControlPanel];
+        return;
+    }
+
     // Store starting state
     _animStartCenterX = _viewState.center_x;
     _animStartCenterY = _viewState.center_y;
@@ -606,10 +881,14 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         _viewState.zoom_level = exp(logStartZoom + (logTargetZoom - logStartZoom) * t);
     }
 
-    // Update HP mode and sync strings
+    // Update HP mode and sync strings (shallow zoom only: the deep path
+    // never animates, so double precision is exact here)
     [self updateHPMode];
-    [self syncHPCenterStrings];
+    mb_view_hp_sync_from_doubles(&_viewState);
     [self invalidateCache];
+
+    // Update control panel displays
+    [self syncControlPanel];
 }
 
 // =============================================================================
@@ -665,7 +944,11 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         for (int x = 0; x < MINIMAP_WIDTH; x++) {
             double cx = MB_FULL_MIN_CX + (x + 0.5) * scaleX;
             unsigned int iteration = mb_compute_point(cx, cy, MINIMAP_MAX_ITER);
-            color_from_iteration(&_minimapBuffer[y * MINIMAP_WIDTH + x], iteration);
+            // color_from_iteration hardcodes MB_MAX_ITER as the interior
+            // check; the minimap iterates to MINIMAP_MAX_ITER, so interior
+            // pixels must be detected against that limit instead.
+            color_from_iteration_classic(&_minimapBuffer[y * MINIMAP_WIDTH + x],
+                                         iteration, MINIMAP_MAX_ITER);
         }
     }
 }
@@ -708,7 +991,8 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         for (int x = 0; x < MINIMAP_WIDTH; x++) {
             double px = minCx + (x + 0.5) * scaleX;
             unsigned int iteration = mb_compute_point(px, py, MINIMAP_MAX_ITER);
-            color_from_iteration(&_minimapZoomedBuffer[y * MINIMAP_WIDTH + x], iteration);
+            color_from_iteration_classic(&_minimapZoomedBuffer[y * MINIMAP_WIDTH + x],
+                                         iteration, MINIMAP_MAX_ITER);
         }
     }
 
@@ -747,6 +1031,10 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     if (indicatorWidth < MIN_INDICATOR_SIZE && _minimapZoomedBuffer) {
         // Calculate zoom needed to make indicator visible
         minimapZoom = MIN_INDICATOR_SIZE / indicatorWidth;
+        // The zoomed minimap renders in plain double precision; past ~1e9
+        // it would be garbage, so cap it (the indicator then simply marks
+        // the neighborhood rather than the exact viewport).
+        if (minimapZoom > 1e9) minimapZoom = 1e9;
         useZoomedMinimap = YES;
 
         // Check if cached zoomed buffer is still valid:
@@ -1196,25 +1484,30 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 // =============================================================================
 
 - (void)zoomTowardsPoint:(NSPoint)point delta:(double)delta {
-    // Get complex coords at mouse BEFORE zoom
-    double scale = mb_view_get_scale(&_viewState);
-    double mouse_cx = _viewState.center_x + (point.x - _viewState.viewport_width / 2.0) * scale;
-    double mouse_cy = _viewState.center_y - (point.y - _viewState.viewport_height / 2.0) * scale;
+    // Clamp the per-event factor: momentum scrolls can deliver deltas that
+    // would make the factor zero or negative, which would slam the zoom to
+    // the clamp boundary (e.g. from 1e50 straight to 1x).
+    if (delta < 0.2) delta = 0.2;
+    if (delta > 5.0) delta = 5.0;
 
-    // Apply zoom
-    _viewState.zoom_level *= delta;
+    // point.y is already flipped to screen-down by the callers; the
+    // imaginary axis grows upward. All center math happens in MPFR so the
+    // center stays meaningful beyond double precision (zoom > ~1e13).
+    double offX = point.x - _viewState.viewport_width / 2.0;
+    double offYUp = _viewState.viewport_height / 2.0 - point.y;
 
-    // Clamp zoom level (no upper limit - MPFR handles arbitrary precision)
-    if (_viewState.zoom_level < 0.1) _viewState.zoom_level = 0.1;
+    mb_view_hp_zoom_towards(&_viewState, offX, offYUp, delta);
 
-    // Recalculate center so mouse point stays fixed
-    double new_scale = mb_view_get_scale(&_viewState);
-    _viewState.center_x = mouse_cx - (point.x - _viewState.viewport_width / 2.0) * new_scale;
-    _viewState.center_y = mouse_cy + (point.y - _viewState.viewport_height / 2.0) * new_scale;
-
-    // Update HP mode and sync strings
+    // Update HP mode tracking
     [self updateHPMode];
-    [self syncHPCenterStrings];
+
+    // Update control panel displays
+    [self syncControlPanel];
+
+    // Show zoom slider overlay briefly
+    if (_zoomSlider) {
+        [_zoomSlider showWithFade];
+    }
 }
 
 // =============================================================================
@@ -1239,16 +1532,15 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
         loc.y = self.bounds.size.height - loc.y;
         [self zoomTowardsPoint:loc delta:delta];
-    } else {
-        // Regular scroll = pan
+    } else if (_viewState.zoom_level > 1.0) {
+        // Regular scroll = pan (only when zoomed in)
         double scale = mb_view_get_scale(&_viewState);
-        _viewState.center_x -= event.scrollingDeltaX * scale;
-        _viewState.center_y += event.scrollingDeltaY * scale;
+        mb_view_hp_translate(&_viewState,
+                             -event.scrollingDeltaX * scale,
+                             event.scrollingDeltaY * scale);
 
-        // Sync HP strings if in HP mode
-        if (_highPrecisionMode) {
-            [self syncHPCenterStrings];
-        }
+        // Update control panel
+        [self syncControlPanel];
     }
     [self invalidateCache];
 }
@@ -1260,18 +1552,20 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 }
 
 - (void)mouseDragged:(NSEvent *)event {
+    // No panning at 1x zoom - nothing useful outside default bounds
+    if (_viewState.zoom_level <= 1.0) return;
+
     // Pan by dragging
     NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
     loc.y = self.bounds.size.height - loc.y;
 
     double scale = mb_view_get_scale(&_viewState);
-    _viewState.center_x -= (loc.x - _lastDragPoint.x) * scale;
-    _viewState.center_y += (loc.y - _lastDragPoint.y) * scale;
+    mb_view_hp_translate(&_viewState,
+                         -(loc.x - _lastDragPoint.x) * scale,
+                         (loc.y - _lastDragPoint.y) * scale);
 
-    // Sync HP strings if in HP mode
-    if (_highPrecisionMode) {
-        [self syncHPCenterStrings];
-    }
+    // Update control panel
+    [self syncControlPanel];
 
     _lastDragPoint = loc;
     [self invalidateCache];
@@ -1330,34 +1624,49 @@ static void handleTogglePresetMenu(MandelbrotView *self) {
 }
 
 static void handleEscape(MandelbrotView *self) {
+    // First close coordinate picker if active
+    if (self->_coordinateMarker && self->_coordinateMarker.pickerModeActive) {
+        [self->_coordinateMarker setPickerMode:NO];
+        return;
+    }
+    // Also hide marker if placed
+    if (self->_coordinateMarker && self->_coordinateMarker.state != MBMarkerStateHidden) {
+        [self->_coordinateMarker hideMarker];
+        return;
+    }
+    // Otherwise close window
     [self.window close];
 }
 
 static void handlePanUp(MandelbrotView *self) {
+    if (self->_viewState.zoom_level <= 1.0) return;
     double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
-    self->_viewState.center_y -= panAmount;
-    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    mb_view_hp_translate(&self->_viewState, 0.0, panAmount);
+    [self syncControlPanel];
     [self invalidateCache];
 }
 
 static void handlePanDown(MandelbrotView *self) {
+    if (self->_viewState.zoom_level <= 1.0) return;
     double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
-    self->_viewState.center_y += panAmount;
-    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    mb_view_hp_translate(&self->_viewState, 0.0, -panAmount);
+    [self syncControlPanel];
     [self invalidateCache];
 }
 
 static void handlePanLeft(MandelbrotView *self) {
+    if (self->_viewState.zoom_level <= 1.0) return;
     double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
-    self->_viewState.center_x -= panAmount;
-    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    mb_view_hp_translate(&self->_viewState, -panAmount, 0.0);
+    [self syncControlPanel];
     [self invalidateCache];
 }
 
 static void handlePanRight(MandelbrotView *self) {
+    if (self->_viewState.zoom_level <= 1.0) return;
     double panAmount = 50.0 * mb_view_get_scale(&self->_viewState);
-    self->_viewState.center_x += panAmount;
-    if (self->_highPrecisionMode) [self syncHPCenterStrings];
+    mb_view_hp_translate(&self->_viewState, panAmount, 0.0);
+    [self syncControlPanel];
     [self invalidateCache];
 }
 
@@ -1376,6 +1685,7 @@ static void handleCyclePalette(MandelbrotView *self) {
     self->_renderSettings.palette_id = (self->_renderSettings.palette_id + 1) % MB_PALETTE_COUNT;
     // Invalidate render cache since colors will change
     [self invalidateRenderCache];
+    [self saveRenderSettings];
 }
 
 static void handleToggleSmoothColoring(MandelbrotView *self) {
@@ -1387,6 +1697,7 @@ static void handleToggleSmoothColoring(MandelbrotView *self) {
     }
     // Invalidate render cache since colors will change
     [self invalidateRenderCache];
+    [self saveRenderSettings];
 }
 
 static void handleToggleAntialiasing(MandelbrotView *self) {
@@ -1394,6 +1705,41 @@ static void handleToggleAntialiasing(MandelbrotView *self) {
     self->_renderSettings.antialiasing_enabled = !self->_renderSettings.antialiasing_enabled;
     // Invalidate render cache since rendering changes
     [self invalidateRenderCache];
+    [self saveRenderSettings];
+}
+
+static void handleDecreaseColorCycleScale(MandelbrotView *self) {
+    // Decrease cycle scale = more bands (tighter cycling)
+    self->_renderSettings.color_cycle_scale *= 0.5f;
+    if (self->_renderSettings.color_cycle_scale < 8.0f) {
+        self->_renderSettings.color_cycle_scale = 8.0f;
+    }
+    [self invalidateRenderCache];
+    [self saveRenderSettings];
+}
+
+static void handleIncreaseColorCycleScale(MandelbrotView *self) {
+    // Increase cycle scale = fewer bands (smoother gradient)
+    self->_renderSettings.color_cycle_scale *= 2.0f;
+    if (self->_renderSettings.color_cycle_scale > 512.0f) {
+        self->_renderSettings.color_cycle_scale = 512.0f;
+    }
+    [self invalidateRenderCache];
+    [self saveRenderSettings];
+}
+
+static void handleToggleControlPanel(MandelbrotView *self) {
+    if (self->_controlPanel) {
+        [self->_controlPanel toggleCollapsed];
+    }
+}
+
+static void handleToggleCoordinatePicker(MandelbrotView *self) {
+    if (self->_coordinateMarker) {
+        [self->_coordinateMarker togglePickerMode];
+        // Update the cached view state for coordinate conversion
+        [self->_coordinateMarker updateViewState:&self->_viewState];
+    }
 }
 
 static void handlePresetKey(MandelbrotView *self, unichar key) {
@@ -1493,7 +1839,36 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
 
 - (void)invalidateCache {
     tile_cache_new_generation(&_scheduler.cache);
+    uint64_t gen = atomic_fetch_add(&_viewGeneration, 1) + 1;
+    _lastViewChangeTime = CFAbsoluteTimeGetCurrent();
+    if (_deepRenderer) {
+        // Let in-flight deep tiles abort mid-render
+        mb_deep_renderer_note_generation(_deepRenderer, gen);
+    }
     _needsRedraw = YES;
+}
+
+// Fingerprint of every render setting that changes tile pixels. Bump the
+// version constant when the coloring or iteration formula changes so old
+// disk tiles are not served for new renders.
+- (uint32_t)renderSettingsFingerprint {
+    uint32_t fp = 2166136261u;  // FNV-1a
+    uint32_t values[4] = {
+        (uint32_t)_renderSettings.color_mode,
+        (uint32_t)_renderSettings.palette_id,
+        (uint32_t)lroundf(_renderSettings.color_cycle_scale * 100.0f),
+        2u,  // formula version (bumped: zoom-scaled iterations)
+    };
+    for (int i = 0; i < 4; i++) {
+        fp = (fp ^ values[i]) * 16777619u;
+    }
+    return fp;
+}
+
+- (void)updateDiskCacheVariant {
+    if (_scheduler.disk_cache) {
+        disk_cache_set_variant(_scheduler.disk_cache, [self renderSettingsFingerprint]);
+    }
 }
 
 - (void)invalidateRenderCache {
@@ -1506,6 +1881,16 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     // Also clear scheduler cache
     tile_cache_new_generation(&_scheduler.cache);
 
+    // Disk tiles are keyed by render settings; repoint the cache
+    [self updateDiskCacheVariant];
+
+    // Deep tiles are colored too — force recompute
+    uint64_t gen = atomic_fetch_add(&_viewGeneration, 1) + 1;
+    _lastDeepFrameValid = NO;
+    if (_deepRenderer) {
+        mb_deep_renderer_note_generation(_deepRenderer, gen);
+    }
+
     _needsRedraw = YES;
 }
 
@@ -1517,7 +1902,7 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
         [self updateAnimation];
     }
 
-    if (_needsRedraw) {
+    if (_needsRedraw || _deepNeedsPoll) {
         [self renderFrame];
         _needsRedraw = NO;
     }
@@ -1600,20 +1985,47 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
 }
 
 - (NSString *)tileKeyForTile:(const MapTile *)tile {
-    return [NSString stringWithFormat:@"%d_%llu_%llu", tile->zoom, tile->x, tile->y];
+    // Include the render-settings fingerprint: tiles are stored post-colored,
+    // and a worker that started before a palette change must not have its
+    // stale-colored result served (or promoted to disk) afterwards.
+    return [NSString stringWithFormat:@"%08x_%d_%llu_%llu",
+            [self renderSettingsFingerprint], tile->zoom, tile->x, tile->y];
+}
+
+// Evict cache entries while holding _asyncCacheLock, sparing the current
+// deep generation: wiping everything would make a deep frame that needs many
+// tiles impossible to complete (each pass would evict the previous tiles).
+- (void)purgeAsyncCacheLocked {
+    if (_asyncTileCache.count < 256) return;
+
+    NSString *keepPrefix = [NSString stringWithFormat:@"deep_%llu_",
+                            (unsigned long long)atomic_load(&_viewGeneration)];
+    NSMutableArray *toRemove = [NSMutableArray array];
+    for (NSString *k in _asyncTileCache) {
+        if (![k hasPrefix:keepPrefix]) {
+            [toRemove addObject:k];
+        }
+    }
+    [_asyncTileCache removeObjectsForKeys:toRemove];
+    // If the current generation alone exceeds the cap, keep it anyway —
+    // a temporarily oversized cache beats a frame that can never finish.
 }
 
 - (BOOL)getTileFromAsyncCache:(const MapTile *)tile output:(PixelColor *)output {
     NSString *key = [self tileKeyForTile:tile];
+    BOOL found = NO;
+
+    // Copy under the lock: a worker thread hitting the cache-size purge can
+    // release the NSData the moment the lock is dropped.
     [_asyncCacheLock lock];
     NSData *data = _asyncTileCache[key];
-    [_asyncCacheLock unlock];
-
     if (data && data.length == MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor)) {
         memcpy(output, data.bytes, data.length);
-        return YES;
+        found = YES;
     }
-    return NO;
+    [_asyncCacheLock unlock];
+
+    return found;
 }
 
 - (void)queueAsyncTileComputation:(MapTile)tile {
@@ -1633,6 +2045,17 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
 
     // Queue async computation
     dispatch_async(_tileQueue, ^{
+        // Skip tiles queued for a pyramid level far from what is displayed
+        // now (the user zoomed past this level before the job started).
+        // Coarser levels within reach stay useful as ancestor placeholders.
+        int curZoom = atomic_load(&self->_currentTargetZoom);
+        if (tile.zoom > curZoom + 2 || tile.zoom < curZoom - 6) {
+            [_asyncCacheLock lock];
+            [_pendingTiles removeObject:key];
+            [_asyncCacheLock unlock];
+            return;
+        }
+
         // Allocate buffer for this tile
         PixelColor *tileBuf = malloc(MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor));
         if (!tileBuf) {
@@ -1643,37 +2066,41 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
         }
 
         // Compute tile (this is the expensive operation)
-        // Note: We compute directly here instead of using scheduler_get_map_tile
-        // because the scheduler is not thread-safe
+        // Note: We compute directly here instead of going through the
+        // scheduler because the scheduler is not thread-safe
         double min_cx, max_cx, min_cy, max_cy;
         mb_tile_to_bounds(&tile, &min_cx, &max_cx, &min_cy, &max_cy);
 
         double scale_x = (max_cx - min_cx) / MB_MAP_TILE_SIZE;
         double scale_y = (max_cy - min_cy) / MB_MAP_TILE_SIZE;
 
+        // Iteration budget scales with tile depth so deep tiles keep detail
+        unsigned int tileMaxIter = mb_max_iter_for_tile_zoom(tile.zoom);
+
         for (int ly = 0; ly < MB_MAP_TILE_SIZE; ly++) {
             double cy = min_cy + (ly + 0.5) * scale_y;
             for (int lx = 0; lx < MB_MAP_TILE_SIZE; lx++) {
                 double cx = min_cx + (lx + 0.5) * scale_x;
                 float final_z2;
-                unsigned int iteration = mb_compute_point_smooth(cx, cy, MAX_ITER, &final_z2);
+                unsigned int iteration = mb_compute_point_smooth(cx, cy, tileMaxIter, &final_z2);
                 color_from_iteration_ex(&tileBuf[ly * MB_MAP_TILE_SIZE + lx],
-                                        iteration, final_z2, MAX_ITER, &capturedSettings);
+                                        iteration, final_z2, tileMaxIter, &capturedSettings);
             }
         }
 
-        // Store in async cache (with memory limit)
-        NSData *tileData = [NSData dataWithBytes:tileBuf length:MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor)];
+        // Store in async cache (with memory limit). alloc/init + release:
+        // GCD worker threads drain autorelease pools at unspecified times,
+        // so autoreleased 256KB buffers could pile up during a long zoom.
+        NSData *tileData = [[NSData alloc] initWithBytes:tileBuf
+                                                  length:MB_MAP_TILE_SIZE * MB_MAP_TILE_SIZE * sizeof(PixelColor)];
 
         [_asyncCacheLock lock];
-        // Limit cache to 256 tiles (~64MB) to prevent unbounded memory growth
-        if (_asyncTileCache.count >= 256) {
-            // Clear oldest entries (simple strategy: remove all when limit hit)
-            [_asyncTileCache removeAllObjects];
-        }
+        // Limit cache size (~64MB) to prevent unbounded memory growth
+        [self purgeAsyncCacheLocked];
         _asyncTileCache[key] = tileData;
         [_pendingTiles removeObject:key];
         [_asyncCacheLock unlock];
+        [tileData release];
 
         free(tileBuf);
 
@@ -1684,47 +2111,24 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     });
 }
 
-- (BOOL)getParentTileData:(const MapTile *)tile buffer:(PixelColor *)output {
-    if (tile->zoom <= 0) return NO;
+// Walk up the tile pyramid looking for a cached ancestor. Fills `output`
+// and returns how many levels up it was found, or -1 if none. Capped at 8
+// levels: beyond that an ancestor contributes less than one source pixel
+// per tile (and blitTileQuadrant's source region would collapse to zero).
+- (int)findAncestorTileData:(const MapTile *)tile into:(PixelColor *)output {
+    MapTile cur = *tile;
+    int offset = 0;
 
-    MapTile parent = {
-        .zoom = tile->zoom - 1,
-        .x = tile->x / 2,
-        .y = tile->y / 2
-    };
+    while (cur.zoom > 0 && offset < 8) {
+        cur.zoom -= 1;
+        cur.x /= 2;
+        cur.y /= 2;
+        offset += 1;
 
-    // Check async cache first
-    if ([self getTileFromAsyncCache:&parent output:output]) return YES;
-
-    // Then check disk cache
-    if (parent.zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache &&
-        disk_cache_get(_scheduler.disk_cache, &parent, output) == 0) return YES;
-
-    // Recursively try grandparent
-    return [self getParentTileData:&parent buffer:output];
-}
-
-- (int)getParentZoomOffset:(const MapTile *)tile {
-    // Returns how many zoom levels up we had to go to find a cached parent
-    if (tile->zoom <= 0) return -1;
-
-    MapTile parent = {
-        .zoom = tile->zoom - 1,
-        .x = tile->x / 2,
-        .y = tile->y / 2
-    };
-
-    // Check async cache first
-    if ([self getTileFromAsyncCache:&parent output:_parentTileBuf]) return 1;
-
-    // Then check disk cache
-    if (parent.zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache &&
-        disk_cache_get(_scheduler.disk_cache, &parent, _parentTileBuf) == 0) return 1;
-
-    // Recursively try grandparent
-    int parentOffset = [self getParentZoomOffset:&parent];
-    if (parentOffset > 0) return parentOffset + 1;
-
+        if ([self getTileFromAsyncCache:&cur output:output]) return offset;
+        if (cur.zoom <= MB_DISK_CACHE_MAX_ZOOM && _scheduler.disk_cache &&
+            disk_cache_get(_scheduler.disk_cache, &cur, output) == 0) return offset;
+    }
     return -1;
 }
 
@@ -1803,42 +2207,39 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     int vp_half_w = _viewState.viewport_width / 2;
     int vp_half_h = _viewState.viewport_height / 2;
 
-    int screen_x0 = (int)((min_cx - _viewState.center_x) / viewScale + vp_half_w);
-    int screen_y0 = (int)((_viewState.center_y - max_cy) / viewScale + vp_half_h);  // Y inverted: max_cy → top of screen
-    int screen_x1 = (int)((max_cx - _viewState.center_x) / viewScale + vp_half_w);
-    int screen_y1 = (int)((_viewState.center_y - min_cy) / viewScale + vp_half_h);  // Y inverted: min_cy → bottom of screen
+    double sx0 = (min_cx - _viewState.center_x) / viewScale + vp_half_w;
+    double sy0 = (_viewState.center_y - max_cy) / viewScale + vp_half_h;  // Y inverted: max_cy → top of screen
+    double sx1 = (max_cx - _viewState.center_x) / viewScale + vp_half_w;
+    double sy1 = (_viewState.center_y - min_cy) / viewScale + vp_half_h;  // Y inverted: min_cy → bottom of screen
+
+    // Casting a double outside int range is undefined behavior; a heavily
+    // stretched tile can exceed it. Skip tiles that far off/large — they
+    // could not be blitted meaningfully anyway.
+    const double kMaxScreenCoord = 1e7;
+    if (fabs(sx0) > kMaxScreenCoord || fabs(sy0) > kMaxScreenCoord ||
+        fabs(sx1) > kMaxScreenCoord || fabs(sy1) > kMaxScreenCoord) {
+        return;
+    }
+
+    int screen_x0 = (int)sx0;
+    int screen_y0 = (int)sy0;
+    int screen_x1 = (int)sx1;
+    int screen_y1 = (int)sy1;
 
     NSRect screenRect = NSMakeRect(screen_x0, screen_y0, screen_x1 - screen_x0, screen_y1 - screen_y0);
 
-    // 3. If still not ready, try parent tile fallback, then queue async computation
+    // 3. If still not ready, try ancestor tile fallback, then queue async computation
     if (!tileReady) {
         MapTile tileCopy = *tile;
         [self queueAsyncTileComputation:tileCopy];
 
-        // Try to render parent tile as placeholder
-        if ([self getParentTileData:tile buffer:_parentTileBuf]) {
-            // Calculate how many zoom levels up we went
-            int zoomOffset = 1;
-            MapTile parent = { .zoom = tile->zoom - 1, .x = tile->x / 2, .y = tile->y / 2 };
-
-            // Check if this parent was the one that matched
-            if (![self getTileFromAsyncCache:&parent output:_mapTileBuf] &&
-                (parent.zoom > MB_DISK_CACHE_MAX_ZOOM || !_scheduler.disk_cache ||
-                 disk_cache_get(_scheduler.disk_cache, &parent, _mapTileBuf) != 0)) {
-                // Parent didn't match, must be grandparent or further up
-                zoomOffset = 2;
-                MapTile grandparent = { .zoom = tile->zoom - 2, .x = tile->x / 4, .y = tile->y / 4 };
-                if (![self getTileFromAsyncCache:&grandparent output:_mapTileBuf] &&
-                    (grandparent.zoom > MB_DISK_CACHE_MAX_ZOOM || !_scheduler.disk_cache ||
-                     disk_cache_get(_scheduler.disk_cache, &grandparent, _mapTileBuf) != 0)) {
-                    zoomOffset = 3;
-                }
-            }
-
-            // Calculate which sub-region of the ancestor corresponds to this tile
-            int mask = (1 << zoomOffset) - 1;
-            int qx = tile->x & mask;
-            int qy = tile->y & mask;
+        // Render the nearest cached ancestor as a placeholder
+        int zoomOffset = [self findAncestorTileData:tile into:_parentTileBuf];
+        if (zoomOffset > 0) {
+            // Which sub-region of the ancestor corresponds to this tile
+            uint64_t mask = ((uint64_t)1 << zoomOffset) - 1;
+            int qx = (int)(tile->x & mask);
+            int qy = (int)(tile->y & mask);
 
             [self blitTileQuadrant:_parentTileBuf quadrantX:qx quadrantY:qy zoomOffset:zoomOffset toRect:screenRect];
         }
@@ -1867,14 +2268,7 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     }
 }
 
-- (void)renderFrame {
-    // Safety checks
-    if (!_framebuffer || _viewState.viewport_width <= 0 || _viewState.viewport_height <= 0) {
-        return;
-    }
-
-    scheduler_update_view(&_scheduler, &_viewState);
-
+- (void)renderMapFrame {
     // 1. Calculate target zoom from view scale
     //    We want tiles at ~1:1 pixel scale (256 tile pixels ≈ 256 screen pixels)
     double viewScale = mb_view_get_scale(&_viewState);
@@ -1882,6 +2276,7 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     int targetZoom = (int)round(log2(MB_REAL_WIDTH / tileWidthNeeded));
     if (targetZoom < 0) targetZoom = 0;
     if (targetZoom > MB_MAX_ZOOM) targetZoom = MB_MAX_ZOOM;
+    atomic_store(&_currentTargetZoom, targetZoom);
 
     // 2. Calculate visible region in complex plane using VIEW scale
     double halfW = (_viewState.viewport_width / 2.0) * viewScale;
@@ -1920,6 +2315,215 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
             MapTile tile = { .zoom = targetZoom, .x = (uint64_t)tx, .y = (uint64_t)ty };
             [self renderMapTile:&tile withViewScale:viewScale];
         }
+    }
+}
+
+// =============================================================================
+// Deep-Zoom Rendering (screen-space perturbation tiles)
+// =============================================================================
+
+- (NSString *)deepTileKeyForGen:(uint64_t)gen tx:(int)tx ty:(int)ty {
+    return [NSString stringWithFormat:@"deep_%llu_%d_%d",
+            (unsigned long long)gen, tx, ty];
+}
+
+- (void)queueDeepTileGen:(uint64_t)gen tx:(int)tx ty:(int)ty key:(NSString *)key {
+    [_asyncCacheLock lock];
+    if ([_pendingTiles containsObject:key] || _asyncTileCache[key] != nil) {
+        [_asyncCacheLock unlock];
+        return;
+    }
+    [_pendingTiles addObject:key];
+    [_asyncCacheLock unlock];
+
+    // Snapshot everything the worker needs (plain structs, copied by value)
+    MBViewState viewCopy = _viewState;
+    MBRenderSettings settingsCopy = _renderSettings;
+    // Quantize the iteration budget so small zoom changes reuse the shared
+    // reference orbit (rebuilding it for every wheel tick would stall all
+    // tile workers behind the renderer mutex).
+    uint32_t maxIter = mb_max_iter_for_zoom(viewCopy.zoom_level);
+    maxIter = (maxIter + 2047u) & ~2047u;
+    int tileSize = MB_MAP_TILE_SIZE;
+
+    dispatch_async(_tileQueue, ^{
+        // The queue may hold jobs for view states the user has zoomed past;
+        // drop them before doing any work.
+        if (atomic_load(&self->_viewGeneration) != gen) {
+            [_asyncCacheLock lock];
+            [_pendingTiles removeObject:key];
+            [_asyncCacheLock unlock];
+            return;
+        }
+
+        size_t tileBytes = (size_t)tileSize * tileSize * sizeof(PixelColor);
+        PixelColor *buf = malloc(tileBytes);
+        int rc = MB_DEEP_ERROR;
+        if (buf) {
+            rc = mb_deep_renderer_render_tile(_deepRenderer, &viewCopy, gen,
+                                              tx * tileSize, ty * tileSize,
+                                              tileSize, maxIter,
+                                              &settingsCopy, buf);
+        }
+
+        [_asyncCacheLock lock];
+        if (rc == MB_DEEP_OK) {
+            [self purgeAsyncCacheLocked];
+            // alloc/init + release below: avoid autoreleased buffers piling
+            // up on GCD worker threads with unspecified pool drains
+            NSData *tileData = [[NSData alloc] initWithBytes:buf length:tileBytes];
+            _asyncTileCache[key] = tileData;
+            [tileData release];
+        }
+        [_pendingTiles removeObject:key];
+        [_asyncCacheLock unlock];
+
+        free(buf);
+
+        if (rc == MB_DEEP_OK) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                _needsRedraw = YES;
+            });
+        }
+    });
+}
+
+- (void)blitDeepTileData:(NSData *)data tx:(int)tx ty:(int)ty {
+    const PixelColor *src = (const PixelColor *)data.bytes;
+    int ts = MB_MAP_TILE_SIZE;
+    int w = _viewState.viewport_width;
+    int h = _viewState.viewport_height;
+    int x0 = tx * ts;
+    int y0 = ty * ts;
+    int copyW = MIN(ts, w - x0);
+    int copyH = MIN(ts, h - y0);
+    if (copyW <= 0 || copyH <= 0) return;
+
+    for (int y = 0; y < copyH; y++) {
+        memcpy(&_framebuffer[(size_t)(y0 + y) * w + x0],
+               &src[(size_t)y * ts],
+               (size_t)copyW * sizeof(PixelColor));
+    }
+}
+
+// Reproject the last completed deep frame under the current view as a
+// placeholder while this generation's tiles are still computing.
+- (void)drawDeepPlaceholder {
+    int w = _viewState.viewport_width;
+    int h = _viewState.viewport_height;
+    size_t pixels = (size_t)w * h;
+
+    if (!_lastDeepFrameValid || !_lastDeepFrame) {
+        memset(_framebuffer, 0, pixels * sizeof(PixelColor));
+        return;
+    }
+
+    double dRe, dIm;
+    mb_view_hp_center_delta(&_lastDeepFrameView, &_viewState, &dRe, &dIm);
+
+    double curScale = mb_view_get_scale(&_viewState);
+    double oldScale = mb_view_get_scale(&_lastDeepFrameView);
+    double ratio = curScale / oldScale;
+
+    int lw = _lastDeepFrameW;
+    int lh = _lastDeepFrameH;
+    double baseX = lw / 2.0 + dRe / oldScale - (w / 2.0) * ratio;
+    double baseY = lh / 2.0 - dIm / oldScale - (h / 2.0) * ratio;
+
+    for (int py = 0; py < h; py++) {
+        double sy = baseY + py * ratio;
+        // Validate in double space BEFORE casting: out-of-range
+        // double-to-int conversion is undefined behavior.
+        BOOL rowValid = (sy >= 0.0 && sy < (double)lh);
+        int syi = rowValid ? (int)sy : 0;
+        for (int px = 0; px < w; px++) {
+            double sx = baseX + px * ratio;
+            PixelColor c = {0, 0, 0};
+            if (rowValid && sx >= 0.0 && sx < (double)lw) {
+                int sxi = (int)sx;
+                c = _lastDeepFrame[(size_t)syi * lw + sxi];
+            }
+            _framebuffer[(size_t)py * w + px] = c;
+        }
+    }
+}
+
+- (void)snapshotDeepFrame {
+    int w = _viewState.viewport_width;
+    int h = _viewState.viewport_height;
+    size_t pixels = (size_t)w * h;
+
+    PixelColor *copy = realloc(_lastDeepFrame, pixels * sizeof(PixelColor));
+    if (!copy) return;
+    _lastDeepFrame = copy;
+    memcpy(_lastDeepFrame, _framebuffer, pixels * sizeof(PixelColor));
+    _lastDeepFrameW = w;
+    _lastDeepFrameH = h;
+    _lastDeepFrameView = _viewState;
+    _lastDeepFrameValid = YES;
+}
+
+- (void)renderDeepFrame {
+    uint64_t gen = atomic_load(&_viewGeneration);
+    int ts = MB_MAP_TILE_SIZE;
+    int w = _viewState.viewport_width;
+    int h = _viewState.viewport_height;
+
+    [self drawDeepPlaceholder];
+
+    // While the user is actively zooming/panning, don't start expensive
+    // perturbation tiles for views that will be gone in the next event —
+    // show only the placeholder until the view settles. (Skip the wait when
+    // there is nothing to show at all.)
+    BOOL settled = (CFAbsoluteTimeGetCurrent() - _lastViewChangeTime) >= MB_DEEP_SETTLE_SECONDS
+                   || !_lastDeepFrameValid;
+
+    int tilesX = (w + ts - 1) / ts;
+    int tilesY = (h + ts - 1) / ts;
+    size_t tileBytes = (size_t)ts * ts * sizeof(PixelColor);
+    BOOL allDone = YES;
+
+    for (int ty = 0; ty < tilesY; ty++) {
+        for (int tx = 0; tx < tilesX; tx++) {
+            NSString *key = [self deepTileKeyForGen:gen tx:tx ty:ty];
+
+            [_asyncCacheLock lock];
+            NSData *data = [[_asyncTileCache[key] retain] autorelease];
+            [_asyncCacheLock unlock];
+
+            if (data && data.length == tileBytes) {
+                [self blitDeepTileData:data tx:tx ty:ty];
+            } else {
+                allDone = NO;
+                if (settled) {
+                    [self queueDeepTileGen:gen tx:tx ty:ty key:key];
+                }
+            }
+        }
+    }
+
+    // If queuing was deferred, keep polling until the view settles
+    _deepNeedsPoll = (!allDone && !settled);
+
+    // Keep a copy of complete frames (before HUD overlays) for reprojection
+    if (allDone) {
+        [self snapshotDeepFrame];
+    }
+}
+
+- (void)renderFrame {
+    // Safety checks
+    if (!_framebuffer || _viewState.viewport_width <= 0 || _viewState.viewport_height <= 0) {
+        return;
+    }
+
+    if (_viewState.zoom_level >= MB_DEEP_ZOOM_THRESHOLD) {
+        // Past double precision for the map-tile pyramid: render
+        // screen-space perturbation tiles instead.
+        [self renderDeepFrame];
+    } else {
+        _deepNeedsPoll = NO;
+        [self renderMapFrame];
     }
 
     // 7. Draw HUD if enabled
@@ -1970,10 +2574,13 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     NSString *scaleLine = [NSString stringWithFormat:@"Scale: %.2e", scale];
 
     NSString *precLine;
-    if (_highPrecisionMode) {
-        precLine = [NSString stringWithFormat:@"Precision: %u bits (HP)", _currentPrecision];
+    if (_viewState.zoom_level >= MB_DEEP_ZOOM_THRESHOLD) {
+        precLine = [NSString stringWithFormat:@"Perturbation: %u-bit ref, %u iter",
+                    (unsigned)mp_required_precision(_viewState.zoom_level),
+                    mb_max_iter_for_zoom(_viewState.zoom_level)];
     } else {
-        precLine = @"Precision: 64 bits (double)";
+        precLine = [NSString stringWithFormat:@"Precision: 64 bits (double), %u iter",
+                    mb_max_iter_for_zoom(_viewState.zoom_level)];
     }
 
     NSString *tilesLine = [NSString stringWithFormat:@"Tiles: %lu cached, %lu pending",
@@ -1983,9 +2590,10 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     NSString *colorModeName = (_renderSettings.color_mode == MB_COLOR_MODE_SMOOTH) ? @"Smooth" : @"Classic";
     NSString *paletteName = [NSString stringWithUTF8String:kPaletteNames[_renderSettings.palette_id]];
     NSString *aaStatus = _renderSettings.antialiasing_enabled ? @"AA:ON" : @"AA:OFF";
-    NSString *renderLine = [NSString stringWithFormat:@"%@ | %@ | %@", colorModeName, paletteName, aaStatus];
+    NSString *cycleStr = [NSString stringWithFormat:@"Cycle:%.0f", _renderSettings.color_cycle_scale];
+    NSString *renderLine = [NSString stringWithFormat:@"%@ | %@ | %@ | %@", colorModeName, paletteName, aaStatus, cycleStr];
 
-    NSString *helpLine = @"Keys: I=HUD S=smooth N=palette A=AA P=presets R=reset";
+    NSString *helpLine = @"Keys: I=HUD S=smooth N=palette A=AA [/]=cycle";
 
     NSString *hudText = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@\n%@\n%@",
                         zoomLine, centerLine, scaleLine, precLine, tilesLine, renderLine, helpLine];
@@ -2200,6 +2808,8 @@ static MandelbrotAppDelegate *g_appDelegate = nil;
 static NSWindow *g_window = nil;
 static MandelbrotWindowController *g_windowController = nil;
 static MandelbrotView *g_view = nil;
+static NSSplitView *g_splitView = nil;
+static MBControlPanel *g_controlPanel = nil;
 
 // =============================================================================
 // Public API
@@ -2260,18 +2870,47 @@ int native_viewer_init(const char *title, int width, int height, bool clear_cach
     [g_window setTitle:titleStr];
     [g_window setMinSize:NSMakeSize(400, 300)];
 
-    // Create view
-    MB_DEBUG_LOG(@"native_viewer_init: creating view");
-    g_view = [[MandelbrotView alloc] initWithFrame:frame];
+    // Create split view to hold control panel and Mandelbrot view
+    MB_DEBUG_LOG(@"native_viewer_init: creating split view");
+    g_splitView = [[NSSplitView alloc] initWithFrame:frame];
+    [g_splitView retain];  // Retain for non-ARC
+    [g_splitView setVertical:YES];  // Side-by-side layout
+    [g_splitView setDividerStyle:NSSplitViewDividerStyleThin];
+
+    // Create control panel (left side)
+    NSRect panelFrame = NSMakeRect(0, 0, MB_CONTROL_PANEL_WIDTH, height);
+    g_controlPanel = [[MBControlPanel alloc] initWithFrame:panelFrame];
+    [g_controlPanel retain];  // Retain for non-ARC
+
+    // Create Mandelbrot view (right side - takes remaining space)
+    NSRect viewFrame = NSMakeRect(0, 0, width - MB_CONTROL_PANEL_WIDTH, height);
+    MB_DEBUG_LOG(@"native_viewer_init: creating Mandelbrot view");
+    g_view = [[MandelbrotView alloc] initWithFrame:viewFrame];
     if (!g_view) {
         MB_DEBUG_LOG(@"native_viewer_init: view creation FAILED");
+        [g_splitView release];
+        [g_controlPanel release];
         [g_window release];
         return -1;
     }
     [g_view retain];  // Retain for non-ARC
     MB_DEBUG_LOG(@"native_viewer_init: view created");
 
-    [g_window setContentView:g_view];
+    // Add subviews to split view (order matters: first = left, second = right)
+    [g_splitView addSubview:g_controlPanel];
+    [g_splitView addSubview:g_view];
+
+    // Set holding priority so control panel keeps its size when window is resized
+    [g_splitView setHoldingPriority:NSLayoutPriorityDefaultHigh forSubviewAtIndex:0];
+    [g_splitView setHoldingPriority:NSLayoutPriorityDefaultLow forSubviewAtIndex:1];
+
+    // Position the divider - start collapsed (hidden)
+    [g_splitView setPosition:0.0 ofDividerAtIndex:0];
+
+    // Connect control panel to view
+    [g_view setControlPanel:g_controlPanel];
+
+    [g_window setContentView:g_splitView];
 
     // Create window controller
     g_windowController = [[MandelbrotWindowController alloc] initWithWindow:g_window];
@@ -2307,6 +2946,14 @@ void native_viewer_shutdown(void) {
     if (g_view) {
         [g_view release];
         g_view = nil;
+    }
+    if (g_controlPanel) {
+        [g_controlPanel release];
+        g_controlPanel = nil;
+    }
+    if (g_splitView) {
+        [g_splitView release];
+        g_splitView = nil;
     }
     if (g_windowController) {
         [g_windowController release];

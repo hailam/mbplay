@@ -1,6 +1,133 @@
 #include "gpu.h"
 #include "../color/color.h"
 #include "../precision/mp_real.h"
+#include "../perturbation/perturb_cpu.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+// =============================================================================
+// Perturbation V2 — CPU implementation (platform independent)
+// =============================================================================
+//
+// Metal has no double type, so the former double2 V2 kernels could never
+// compile — worse, their presence made the whole shader library fail to
+// build at runtime, disabling every (valid) float kernel as well. The V2
+// entry points below keep their public names but run on the CPU via
+// perturb_cpu.c, which also removes the need for glitch markers (rebasing).
+
+static double *cpuRefRe = NULL;      // CPU copy of the reference orbit
+static double *cpuRefIm = NULL;
+static uint32_t cpuRefLen = 0;       // usable entries in the copy
+static uint32_t perturbMaxIter = 0;  // capacity of the copy
+static bool perturbInitialized = false;
+
+static int perturb_cpu_state_init(uint32_t max_iter) {
+    free(cpuRefRe);
+    free(cpuRefIm);
+    cpuRefRe = (double *)malloc((size_t)max_iter * sizeof(double));
+    cpuRefIm = (double *)malloc((size_t)max_iter * sizeof(double));
+    cpuRefLen = 0;
+    if (!cpuRefRe || !cpuRefIm) {
+        free(cpuRefRe);
+        free(cpuRefIm);
+        cpuRefRe = NULL;
+        cpuRefIm = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static void perturb_cpu_state_free(void) {
+    free(cpuRefRe);
+    free(cpuRefIm);
+    cpuRefRe = NULL;
+    cpuRefIm = NULL;
+    cpuRefLen = 0;
+    perturbInitialized = false;
+}
+
+void gpu_update_reference_orbit(const ReferenceOrbit *orbit) {
+    if (!perturbInitialized || !cpuRefRe || !orbit || !orbit->valid) {
+        return;
+    }
+
+    // Stored entries run from 0 to escape_iter inclusive when the reference
+    // escaped early, and from 0 to max_iter-1 when it never escaped.
+    uint32_t count = orbit->escape_iter + 1;
+    if (count > perturbMaxIter) count = perturbMaxIter;
+    if (count > orbit->max_iter) count = orbit->max_iter;
+    if (count == 0) return;
+
+    memcpy(cpuRefRe, orbit->z_real, count * sizeof(double));
+    memcpy(cpuRefIm, orbit->z_imag, count * sizeof(double));
+    cpuRefLen = count;
+}
+
+void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
+                                  const double *deltas,
+                                  PixelColor *output, uint32_t *iterations_out) {
+    if (!perturbInitialized || cpuRefLen == 0 || !params || !deltas || !output) {
+        return;
+    }
+
+    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
+    uint32_t *iters = iterations_out;
+    uint32_t *local = NULL;
+    if (!iters) {
+        local = (uint32_t *)malloc(tilePixels * sizeof(uint32_t));
+        if (!local) return;
+        iters = local;
+    }
+
+    perturb_cpu_tile(cpuRefRe, cpuRefIm, cpuRefLen, deltas,
+                     params->tile_size, params->max_iter, iters, NULL);
+
+    for (size_t i = 0; i < tilePixels; i++) {
+        color_from_iteration_classic(&output[i], iters[i], params->max_iter);
+    }
+
+    free(local);
+}
+
+void gpu_compute_tile_perturb_v2_smooth(const GPUPerturbParamsV2 *params,
+                                        const double *deltas,
+                                        PixelColor *output,
+                                        uint32_t *iterations_out,
+                                        const MBRenderSettings *settings) {
+    if (!perturbInitialized || cpuRefLen == 0 || !params || !deltas || !output) {
+        return;
+    }
+
+    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
+    uint32_t *iters = iterations_out;
+    uint32_t *local = NULL;
+    if (!iters) {
+        local = (uint32_t *)malloc(tilePixels * sizeof(uint32_t));
+        if (!local) return;
+        iters = local;
+    }
+    float *z2 = (float *)malloc(tilePixels * sizeof(float));
+    if (!z2) {
+        free(local);
+        return;
+    }
+
+    perturb_cpu_tile(cpuRefRe, cpuRefIm, cpuRefLen, deltas,
+                     params->tile_size, params->max_iter, iters, z2);
+
+    for (size_t i = 0; i < tilePixels; i++) {
+        color_from_iteration_ex(&output[i], iters[i], z2[i],
+                                params->max_iter, settings);
+    }
+
+    free(z2);
+    free(local);
+}
+
+bool gpu_perturbation_initialized(void) {
+    return perturbInitialized;
+}
 
 #ifdef MB_GPU_METAL
 
@@ -53,22 +180,14 @@ static int tileSize = 0;
 static int tileMaxIter = 0;
 static bool tilesInitialized = false;
 
-// Perturbation compute state
+// Perturbation compute state (V1 float kernel, deprecated but kept working)
 static MtComputePipelineState *pipelinePerturb = NULL;
 static MtBuffer *perturbParamsBuffer = NULL;
 static MtBuffer *refOrbitBuffer = NULL;
 static MtBuffer *perturbIterBuffer = NULL;
-static uint32_t perturbMaxIter = 0;
-static bool perturbInitialized = false;
-
-// Perturbation V2 compute state (pre-computed deltas)
-static MtComputePipelineState *pipelinePerturbV2 = NULL;
-static MtBuffer *perturbParamsV2Buffer = NULL;
-static MtBuffer *deltaBuffer = NULL;
 
 // Smooth coloring state
 static MtComputePipelineState *pipelineTileSmooth = NULL;
-static MtComputePipelineState *pipelinePerturbV2Smooth = NULL;
 static MtBuffer *finalZ2Buffer = NULL;
 static bool smoothInitialized = false;
 
@@ -97,13 +216,6 @@ typedef struct {
     uint32_t tile_x, tile_y, tile_size, max_iter;
     uint32_t ref_escape_iter, vp_half_w, vp_half_h;
 } PerturbParams;
-
-// PerturbParamsV2 struct for GPU (must match Metal shader)
-typedef struct {
-    uint32_t tile_size;
-    uint32_t max_iter;
-    uint32_t ref_escape_iter;
-} PerturbParamsV2;
 
 // =============================================================================
 // GPU API Implementation
@@ -219,7 +331,8 @@ void gpu_compute_row(int y, PixelColor *output) {
     // Apply color mapping on CPU
     uint32_t *iterations = mtBufferContents(rowIterBuffer);
     for (int x = 0; x < gpuConfig.width; x++) {
-        color_from_iteration(&output[x], iterations[x]);
+        color_from_iteration_classic(&output[x], iterations[x],
+                                     (unsigned int)gpuConfig.max_iter);
     }
     // Command buffer is autoreleased by CMT
 }
@@ -250,7 +363,8 @@ void gpu_compute_full(PixelColor *output) {
     uint32_t *iterations = mtBufferContents(iterBuffer);
     size_t totalPixels = (size_t)gpuConfig.width * gpuConfig.height;
     for (size_t i = 0; i < totalPixels; i++) {
-        color_from_iteration(&output[i], iterations[i]);
+        color_from_iteration_classic(&output[i], iterations[i],
+                                     (unsigned int)gpuConfig.max_iter);
     }
     // Command buffer is autoreleased by CMT
 }
@@ -272,29 +386,11 @@ void gpu_cleanup(void) {
         mtRelease(finalZ2Buffer);
         finalZ2Buffer = NULL;
     }
-    if (pipelinePerturbV2Smooth) {
-        mtRelease(pipelinePerturbV2Smooth);
-        pipelinePerturbV2Smooth = NULL;
-    }
     if (pipelineTileSmooth) {
         mtRelease(pipelineTileSmooth);
         pipelineTileSmooth = NULL;
     }
     smoothInitialized = false;
-
-    // Perturbation V2 buffers
-    if (deltaBuffer) {
-        mtRelease(deltaBuffer);
-        deltaBuffer = NULL;
-    }
-    if (perturbParamsV2Buffer) {
-        mtRelease(perturbParamsV2Buffer);
-        perturbParamsV2Buffer = NULL;
-    }
-    if (pipelinePerturbV2) {
-        mtRelease(pipelinePerturbV2);
-        pipelinePerturbV2 = NULL;
-    }
 
     // Perturbation buffers
     if (perturbIterBuffer) {
@@ -313,7 +409,7 @@ void gpu_cleanup(void) {
         mtRelease(pipelinePerturb);
         pipelinePerturb = NULL;
     }
-    perturbInitialized = false;
+    perturb_cpu_state_free();
 
     // Tile buffers
     if (tileParamsBuffer) {
@@ -465,7 +561,7 @@ void gpu_compute_tile(const GPUTileParams *params, PixelColor *output) {
     uint32_t *iterations = mtBufferContents(tileIterBuffer);
     size_t tilePixels = (size_t)params->tile_size * params->tile_size;
     for (size_t i = 0; i < tilePixels; i++) {
-        color_from_iteration(&output[i], iterations[i]);
+        color_from_iteration_classic(&output[i], iterations[i], params->max_iter);
     }
 
     // Release our retained reference (balances the retain above)
@@ -481,136 +577,48 @@ bool gpu_tiles_initialized(void) {
 // =============================================================================
 
 int gpu_init_perturbation(uint32_t max_iter) {
-    // Ensure we have basic GPU resources
-    if (!device) {
-        device = mtCreateSystemDefaultDevice();
-        if (!device) return -1;
+    // CPU-side perturbation state; works with or without a GPU.
+    // (The V1 float GPU kernel is no longer wired up: its reference-orbit
+    // buffer was typed float2 on the GPU but filled with doubles from the
+    // CPU, and the V2 double kernels could never compile. Perturbation now
+    // runs on the CPU — see the shared section at the top of this file.)
+    if (perturb_cpu_state_init(max_iter) != 0) {
+        return -1;
+    }
 
-        commandQueue = mtNewCommandQueue(device);
-        if (!commandQueue) {
-            gpu_cleanup();
-            return -1;
+    // Optional GPU float pipelines for smooth/AA tile rendering. Failures
+    // here do not disable perturbation itself.
+    if (device && library) {
+        MtFunction *kernelTileSmooth = mtNewFunctionWithName(library, "mandelbrot_compute_tile_smooth");
+        if (kernelTileSmooth) {
+            pipelineTileSmooth = mtNewComputePipelineStateWithFunction(device, kernelTileSmooth, NULL);
+            mtRelease(kernelTileSmooth);
         }
 
-        NsError *error = NULL;
-        library = mtNewLibraryWithSource(device, (char*)METAL_SHADER_SOURCE, NULL, &error);
-        if (!library) {
-            fprintf(stderr, "Metal shader compilation failed\n");
-            gpu_cleanup();
-            return -1;
+        // Allocate final_z2 buffer (one float per pixel)
+        size_t z2BufferSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(float);
+        finalZ2Buffer = mtDeviceNewBufferWithLength(device, z2BufferSize, MtResourceStorageModeShared);
+
+        smoothInitialized = (pipelineTileSmooth != NULL && finalZ2Buffer != NULL);
+
+        // Initialize supersampling pipeline
+        MtFunction *kernelTileSS4 = mtNewFunctionWithName(library, "mandelbrot_compute_tile_ss4");
+        if (kernelTileSS4) {
+            pipelineTileSS4 = mtNewComputePipelineStateWithFunction(device, kernelTileSS4, NULL);
+            mtRelease(kernelTileSS4);
         }
+
+        // Allocate smooth iteration buffer (one float per pixel for supersampled output)
+        size_t smoothIterSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(float);
+        smoothIterBuffer = mtDeviceNewBufferWithLength(device, smoothIterSize, MtResourceStorageModeShared);
+
+        supersampleInitialized = (pipelineTileSS4 != NULL && smoothIterBuffer != NULL);
     }
-
-    // Create perturbation compute pipeline
-    MtFunction *kernelPerturb = mtNewFunctionWithName(library, "mandelbrot_compute_perturb");
-    if (!kernelPerturb) {
-        fprintf(stderr, "Could not find mandelbrot_compute_perturb function\n");
-        return -1;
-    }
-    pipelinePerturb = mtNewComputePipelineStateWithFunction(device, kernelPerturb, NULL);
-    mtRelease(kernelPerturb);
-
-    if (!pipelinePerturb) {
-        fprintf(stderr, "Could not create perturbation pipeline\n");
-        return -1;
-    }
-
-    // Allocate perturbation buffers
-    // Reference orbit: array of double2 (16 bytes per iteration)
-    size_t refOrbitSize = max_iter * 2 * sizeof(double);
-    refOrbitBuffer = mtDeviceNewBufferWithLength(device, refOrbitSize, MtResourceStorageModeShared);
-
-    // Params buffer
-    perturbParamsBuffer = mtDeviceNewBufferWithLength(device, sizeof(PerturbParams), MtResourceStorageModeShared);
-
-    // Iteration buffer (same size as tile buffer - use MB_INTERACTIVE_TILE_SIZE)
-    size_t iterSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(uint32_t);
-    perturbIterBuffer = mtDeviceNewBufferWithLength(device, iterSize, MtResourceStorageModeShared);
-
-    if (!refOrbitBuffer || !perturbParamsBuffer || !perturbIterBuffer) {
-        gpu_cleanup();
-        return -1;
-    }
-
-    // Create V2 perturbation pipeline
-    MtFunction *kernelPerturbV2 = mtNewFunctionWithName(library, "mandelbrot_compute_perturb_v2");
-    if (!kernelPerturbV2) {
-        fprintf(stderr, "Could not find mandelbrot_compute_perturb_v2 function\n");
-        gpu_cleanup();
-        return -1;
-    }
-    pipelinePerturbV2 = mtNewComputePipelineStateWithFunction(device, kernelPerturbV2, NULL);
-    mtRelease(kernelPerturbV2);
-
-    if (!pipelinePerturbV2) {
-        fprintf(stderr, "Could not create perturbation V2 pipeline\n");
-        gpu_cleanup();
-        return -1;
-    }
-
-    // Allocate V2 buffers
-    perturbParamsV2Buffer = mtDeviceNewBufferWithLength(device, sizeof(PerturbParamsV2), MtResourceStorageModeShared);
-
-    // Delta buffer: 2 doubles per pixel (tile_size^2 * 2 * sizeof(double))
-    size_t deltaBufferSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * 2 * sizeof(double);
-    deltaBuffer = mtDeviceNewBufferWithLength(device, deltaBufferSize, MtResourceStorageModeShared);
-
-    if (!perturbParamsV2Buffer || !deltaBuffer) {
-        gpu_cleanup();
-        return -1;
-    }
-
-    // Initialize smooth coloring pipelines
-    MtFunction *kernelTileSmooth = mtNewFunctionWithName(library, "mandelbrot_compute_tile_smooth");
-    if (kernelTileSmooth) {
-        pipelineTileSmooth = mtNewComputePipelineStateWithFunction(device, kernelTileSmooth, NULL);
-        mtRelease(kernelTileSmooth);
-    }
-
-    MtFunction *kernelPerturbV2Smooth = mtNewFunctionWithName(library, "mandelbrot_compute_perturb_v2_smooth");
-    if (kernelPerturbV2Smooth) {
-        pipelinePerturbV2Smooth = mtNewComputePipelineStateWithFunction(device, kernelPerturbV2Smooth, NULL);
-        mtRelease(kernelPerturbV2Smooth);
-    }
-
-    // Allocate final_z2 buffer (one float per pixel)
-    size_t z2BufferSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(float);
-    finalZ2Buffer = mtDeviceNewBufferWithLength(device, z2BufferSize, MtResourceStorageModeShared);
-
-    smoothInitialized = (pipelineTileSmooth != NULL && pipelinePerturbV2Smooth != NULL && finalZ2Buffer != NULL);
-
-    // Initialize supersampling pipeline
-    MtFunction *kernelTileSS4 = mtNewFunctionWithName(library, "mandelbrot_compute_tile_ss4");
-    if (kernelTileSS4) {
-        pipelineTileSS4 = mtNewComputePipelineStateWithFunction(device, kernelTileSS4, NULL);
-        mtRelease(kernelTileSS4);
-    }
-
-    // Allocate smooth iteration buffer (one float per pixel for supersampled output)
-    size_t smoothIterSize = MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(float);
-    smoothIterBuffer = mtDeviceNewBufferWithLength(device, smoothIterSize, MtResourceStorageModeShared);
-
-    supersampleInitialized = (pipelineTileSS4 != NULL && smoothIterBuffer != NULL);
 
     perturbMaxIter = max_iter;
     perturbInitialized = true;
 
     return 0;
-}
-
-void gpu_update_reference_orbit(const ReferenceOrbit *orbit) {
-    if (!perturbInitialized || !refOrbitBuffer || !orbit || !orbit->valid) {
-        return;
-    }
-
-    // Copy reference orbit to GPU as double2 array
-    double *buffer = mtBufferContents(refOrbitBuffer);
-    uint32_t count = orbit->escape_iter < perturbMaxIter ? orbit->escape_iter : perturbMaxIter;
-
-    for (uint32_t i = 0; i < count; i++) {
-        buffer[i * 2 + 0] = orbit->z_real[i];
-        buffer[i * 2 + 1] = orbit->z_imag[i];
-    }
 }
 
 void gpu_compute_tile_perturb(const GPUPerturbTileParams *params,
@@ -679,15 +687,11 @@ void gpu_compute_tile_perturb(const GPUPerturbTileParams *params,
             output[i].b = 0;
 #endif
         } else {
-            color_from_iteration(&output[i], iter);
+            color_from_iteration_classic(&output[i], iter, params->max_iter);
         }
     }
 
     mtRelease(cmdBuffer);
-}
-
-bool gpu_perturbation_initialized(void) {
-    return perturbInitialized;
 }
 
 void gpu_precompute_deltas(double center_x, double center_y, double scale,
@@ -789,77 +793,6 @@ void gpu_precompute_deltas_hp(
     mp_real_clear(&scaled_offset);
 }
 
-void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
-                                  const double *deltas,
-                                  PixelColor *output, uint32_t *iterations_out) {
-    if (!perturbInitialized || !pipelinePerturbV2) {
-        return;
-    }
-
-    // Copy deltas to GPU buffer
-    double *gpuDeltas = mtBufferContents(deltaBuffer);
-    size_t deltaCount = params->tile_size * params->tile_size * 2;
-    memcpy(gpuDeltas, deltas, deltaCount * sizeof(double));
-
-    // Set V2 parameters
-    PerturbParamsV2 *perturbParams = mtBufferContents(perturbParamsV2Buffer);
-    perturbParams->tile_size = params->tile_size;
-    perturbParams->max_iter = params->max_iter;
-    perturbParams->ref_escape_iter = params->ref_escape_iter;
-
-    // Create command buffer and encoder
-    MtCommandBuffer *cmdBuffer = mtNewCommandBuffer(commandQueue);
-    mtRetain(cmdBuffer);
-    MtComputeCommandEncoder *encoder = mtNewComputeCommandEncoder(cmdBuffer);
-
-    mtComputeCommandEncoderSetComputePipelineState(encoder, pipelinePerturbV2);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, perturbIterBuffer, 0, 0);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, perturbParamsV2Buffer, 0, 1);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, refOrbitBuffer, 0, 2);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, deltaBuffer, 0, 3);
-
-    // Dispatch threads for tile (2D)
-    MtSize gridSize = {(NsUInteger)params->tile_size, (NsUInteger)params->tile_size, 1};
-    MtSize threadgroupSize = {16, 16, 1};
-    mtComputeCommandEncoderDispatchThread_threadsPerThreadgroup(encoder, gridSize, threadgroupSize);
-
-    mtComputeCommandEncoderEndEncoding(encoder);
-    mtCommandBufferCommit(cmdBuffer);
-    mtCommandBufferWaitUntilCompleted(cmdBuffer);
-
-    // Get iteration results
-    uint32_t *iterations = mtBufferContents(perturbIterBuffer);
-    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
-
-    // Copy iterations if requested (for glitch handling)
-    if (iterations_out) {
-        memcpy(iterations_out, iterations, tilePixels * sizeof(uint32_t));
-    }
-
-    // Apply color mapping
-    for (size_t i = 0; i < tilePixels; i++) {
-        uint32_t iter = iterations[i];
-        // Glitch marker pixels will be colored later after CPU fallback
-        if (iter == 0xFFFFFFFE) {
-#ifdef MB_DEBUG
-            // Debug: magenta to make glitches visible
-            output[i].r = 255;
-            output[i].g = 0;
-            output[i].b = 255;
-#else
-            // Production: black placeholder (will be replaced by CPU fallback)
-            output[i].r = 0;
-            output[i].g = 0;
-            output[i].b = 0;
-#endif
-        } else {
-            color_from_iteration(&output[i], iter);
-        }
-    }
-
-    mtRelease(cmdBuffer);
-}
-
 // =============================================================================
 // Smooth Coloring API Implementation
 // =============================================================================
@@ -917,82 +850,6 @@ void gpu_compute_tile_smooth(const GPUTileParams *params,
     mtRelease(cmdBuffer);
 }
 
-void gpu_compute_tile_perturb_v2_smooth(const GPUPerturbParamsV2 *params,
-                                        const double *deltas,
-                                        PixelColor *output,
-                                        uint32_t *iterations_out,
-                                        const MBRenderSettings *settings) {
-    if (!smoothInitialized || !pipelinePerturbV2Smooth) {
-        // Fallback to non-smooth
-        gpu_compute_tile_perturb_v2(params, deltas, output, iterations_out);
-        return;
-    }
-
-    // Copy deltas to GPU buffer
-    double *gpuDeltas = mtBufferContents(deltaBuffer);
-    size_t deltaCount = params->tile_size * params->tile_size * 2;
-    memcpy(gpuDeltas, deltas, deltaCount * sizeof(double));
-
-    // Set V2 parameters
-    PerturbParamsV2 *perturbParams = mtBufferContents(perturbParamsV2Buffer);
-    perturbParams->tile_size = params->tile_size;
-    perturbParams->max_iter = params->max_iter;
-    perturbParams->ref_escape_iter = params->ref_escape_iter;
-
-    // Create command buffer and encoder
-    MtCommandBuffer *cmdBuffer = mtNewCommandBuffer(commandQueue);
-    mtRetain(cmdBuffer);
-    MtComputeCommandEncoder *encoder = mtNewComputeCommandEncoder(cmdBuffer);
-
-    mtComputeCommandEncoderSetComputePipelineState(encoder, pipelinePerturbV2Smooth);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, perturbIterBuffer, 0, 0);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, perturbParamsV2Buffer, 0, 1);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, refOrbitBuffer, 0, 2);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, deltaBuffer, 0, 3);
-    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, finalZ2Buffer, 0, 4);
-
-    // Dispatch threads for tile (2D)
-    MtSize gridSize = {(NsUInteger)params->tile_size, (NsUInteger)params->tile_size, 1};
-    MtSize threadgroupSize = {16, 16, 1};
-    mtComputeCommandEncoderDispatchThread_threadsPerThreadgroup(encoder, gridSize, threadgroupSize);
-
-    mtComputeCommandEncoderEndEncoding(encoder);
-    mtCommandBufferCommit(cmdBuffer);
-    mtCommandBufferWaitUntilCompleted(cmdBuffer);
-
-    // Get iteration results
-    uint32_t *iterations = mtBufferContents(perturbIterBuffer);
-    float *z2Values = mtBufferContents(finalZ2Buffer);
-    size_t tilePixels = (size_t)params->tile_size * params->tile_size;
-
-    // Copy iterations if requested (for glitch handling)
-    if (iterations_out) {
-        memcpy(iterations_out, iterations, tilePixels * sizeof(uint32_t));
-    }
-
-    // Apply color mapping with smooth coloring
-    for (size_t i = 0; i < tilePixels; i++) {
-        uint32_t iter = iterations[i];
-        // Glitch marker pixels will be colored later after CPU fallback
-        if (iter == 0xFFFFFFFE) {
-#ifdef MB_DEBUG
-            output[i].r = 255;
-            output[i].g = 0;
-            output[i].b = 255;
-#else
-            output[i].r = 0;
-            output[i].g = 0;
-            output[i].b = 0;
-#endif
-        } else {
-            color_from_iteration_ex(&output[i], iter, z2Values[i],
-                                    params->max_iter, settings);
-        }
-    }
-
-    mtRelease(cmdBuffer);
-}
-
 void gpu_compute_tile_supersampled(const GPUTileParams *params,
                                    PixelColor *output,
                                    const MBRenderSettings *settings) {
@@ -1036,9 +893,12 @@ void gpu_compute_tile_supersampled(const GPUTileParams *params,
     float *smoothIter = mtBufferContents(smoothIterBuffer);
     size_t tilePixels = (size_t)params->tile_size * params->tile_size;
 
+    // Use default cycle scale if not set (for backward compatibility)
+    float cycle_scale = settings->color_cycle_scale > 0.0f ? settings->color_cycle_scale : 64.0f;
+
     for (size_t i = 0; i < tilePixels; i++) {
         color_from_smooth_iteration(&output[i], smoothIter[i],
-                                    params->max_iter, settings->palette_id);
+                                    params->max_iter, settings->palette_id, cycle_scale);
     }
 
     mtRelease(cmdBuffer);
@@ -1069,6 +929,7 @@ void gpu_compute_full(PixelColor *output) {
 }
 
 void gpu_cleanup(void) {
+    perturb_cpu_state_free();
 }
 
 int gpu_init_tiles(int tile_size, int max_iter) {
@@ -1087,12 +948,13 @@ bool gpu_tiles_initialized(void) {
 }
 
 int gpu_init_perturbation(uint32_t max_iter) {
-    (void)max_iter;
-    return -1;
-}
-
-void gpu_update_reference_orbit(const ReferenceOrbit *orbit) {
-    (void)orbit;
+    // CPU perturbation needs no GPU.
+    if (perturb_cpu_state_init(max_iter) != 0) {
+        return -1;
+    }
+    perturbMaxIter = max_iter;
+    perturbInitialized = true;
+    return 0;
 }
 
 void gpu_compute_tile_perturb(const GPUPerturbTileParams *params,
@@ -1102,29 +964,24 @@ void gpu_compute_tile_perturb(const GPUPerturbTileParams *params,
     (void)iterations;
 }
 
-bool gpu_perturbation_initialized(void) {
-    return false;
-}
-
 void gpu_precompute_deltas(double center_x, double center_y, double scale,
                            double ref_cx, double ref_cy,
                            uint32_t tile_size, int vp_half_w, int vp_half_h,
                            uint32_t tile_px, uint32_t tile_py,
                            double *delta_buffer) {
-    (void)center_x; (void)center_y; (void)scale;
-    (void)ref_cx; (void)ref_cy;
-    (void)tile_size; (void)vp_half_w; (void)vp_half_h;
-    (void)tile_px; (void)tile_py;
-    (void)delta_buffer;
-}
+    for (uint32_t ly = 0; ly < tile_size; ly++) {
+        double py = (double)(tile_py + ly);
+        double delta_cy = center_y + (py - vp_half_h) * scale - ref_cy;
 
-void gpu_compute_tile_perturb_v2(const GPUPerturbParamsV2 *params,
-                                  const double *deltas,
-                                  PixelColor *output, uint32_t *iterations) {
-    (void)params;
-    (void)deltas;
-    (void)output;
-    (void)iterations;
+        for (uint32_t lx = 0; lx < tile_size; lx++) {
+            double px = (double)(tile_px + lx);
+            double delta_cx = center_x + (px - vp_half_w) * scale - ref_cx;
+
+            size_t idx = (ly * tile_size + lx) * 2;
+            delta_buffer[idx + 0] = delta_cx;
+            delta_buffer[idx + 1] = delta_cy;
+        }
+    }
 }
 
 void gpu_precompute_deltas_hp(
@@ -1148,18 +1005,6 @@ void gpu_compute_tile_smooth(const GPUTileParams *params,
                              const MBRenderSettings *settings) {
     (void)params;
     (void)output;
-    (void)settings;
-}
-
-void gpu_compute_tile_perturb_v2_smooth(const GPUPerturbParamsV2 *params,
-                                        const double *deltas,
-                                        PixelColor *output,
-                                        uint32_t *iterations,
-                                        const MBRenderSettings *settings) {
-    (void)params;
-    (void)deltas;
-    (void)output;
-    (void)iterations;
     (void)settings;
 }
 

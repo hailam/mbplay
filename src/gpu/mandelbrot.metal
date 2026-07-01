@@ -200,60 +200,12 @@ kernel void mandelbrot_compute_perturb(
     iterations[gid.y * params.tile_size + gid.x] = iteration;
 }
 
-struct PerturbParamsV2 {
-    uint tile_size, max_iter, ref_escape_iter;
-};
-
-kernel void mandelbrot_compute_perturb_v2(
-    device uint *iterations [[buffer(0)]],
-    constant PerturbParamsV2 &params [[buffer(1)]],
-    constant double2 *ref_orbit [[buffer(2)]],
-    constant double2 *pixel_deltas [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    if (gid.x >= params.tile_size || gid.y >= params.tile_size) return;
-
-    uint idx = gid.y * params.tile_size + gid.x;
-    double2 delta_c = pixel_deltas[idx];  // Pre-computed on CPU in double precision!
-
-    double delta_x = 0.0, delta_y = 0.0;
-    uint iteration = 0;
-    uint max_safe = min(params.max_iter, params.ref_escape_iter);
-
-    while (iteration < max_safe) {
-        double2 z_ref = ref_orbit[iteration];
-        double zx = z_ref.x + delta_x;
-        double zy = z_ref.y + delta_y;
-
-        if (zx*zx + zy*zy >= 4.0) break;
-
-        // d_n+1 = 2*Z_ref*d + d^2 + dC
-        double new_dx = 2.0*(z_ref.x*delta_x - z_ref.y*delta_y)
-                     + delta_x*delta_x - delta_y*delta_y + delta_c.x;
-        double new_dy = 2.0*(z_ref.x*delta_y + z_ref.y*delta_x)
-                     + 2.0*delta_x*delta_y + delta_c.y;
-
-        // Glitch detection: delta magnitude too large relative to reference
-        double delta_mag = new_dx*new_dx + new_dy*new_dy;
-        double ref_mag = z_ref.x*z_ref.x + z_ref.y*z_ref.y;
-        if (delta_mag > ref_mag * 1e6 && ref_mag > 1e-10) {
-            iterations[idx] = 0xFFFFFFFE;
-            return;
-        }
-
-        delta_x = new_dx;
-        delta_y = new_dy;
-        iteration++;
-    }
-
-    // Mark glitch if pixel needs more iterations than reference
-    if (iteration >= params.ref_escape_iter && iteration < params.max_iter) {
-        iterations[idx] = 0xFFFFFFFE;
-        return;
-    }
-
-    iterations[idx] = iteration;
-}
+// NOTE: The former "perturbation V2" kernels used the double/double2 types,
+// which Metal does not support on any Apple GPU. They could never compile,
+// which silently disabled the entire GPU library (newLibraryWithSource fails
+// for the whole source) and with it every float kernel below. V2 perturbation
+// now runs on the CPU in src/perturbation/perturb_cpu.c, which has real
+// 64-bit doubles and needs no glitch markers thanks to rebasing.
 
 // =============================================================================
 // Supersampled Kernels (2x2 MSAA)
@@ -325,63 +277,6 @@ kernel void mandelbrot_compute_tile_ss4(
     smooth_iter[gid.y * params.tile_size + gid.x] = sum / 4.0f;
 }
 
-// Perturbation V2 with smooth coloring support (outputs final |z|^2)
-kernel void mandelbrot_compute_perturb_v2_smooth(
-    device uint *iterations [[buffer(0)]],
-    device float *final_z2 [[buffer(4)]],
-    constant PerturbParamsV2 &params [[buffer(1)]],
-    constant double2 *ref_orbit [[buffer(2)]],
-    constant double2 *pixel_deltas [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]
-) {
-    if (gid.x >= params.tile_size || gid.y >= params.tile_size) return;
-
-    uint idx = gid.y * params.tile_size + gid.x;
-    double2 delta_c = pixel_deltas[idx];  // Pre-computed on CPU in double precision!
-
-    double delta_x = 0.0, delta_y = 0.0;
-    uint iteration = 0;
-    uint max_safe = min(params.max_iter, params.ref_escape_iter);
-    float z2 = 0.0f;
-
-    while (iteration < max_safe) {
-        double2 z_ref = ref_orbit[iteration];
-        double zx = z_ref.x + delta_x;
-        double zy = z_ref.y + delta_y;
-
-        double mag = zx*zx + zy*zy;
-        if (mag >= 4.0) {
-            z2 = float(mag);
-            break;
-        }
-
-        // d_n+1 = 2*Z_ref*d + d^2 + dC
-        double new_dx = 2.0*(z_ref.x*delta_x - z_ref.y*delta_y)
-                     + delta_x*delta_x - delta_y*delta_y + delta_c.x;
-        double new_dy = 2.0*(z_ref.x*delta_y + z_ref.y*delta_x)
-                     + 2.0*delta_x*delta_y + delta_c.y;
-
-        // Glitch detection: delta magnitude too large relative to reference
-        double delta_mag = new_dx*new_dx + new_dy*new_dy;
-        double ref_mag = z_ref.x*z_ref.x + z_ref.y*z_ref.y;
-        if (delta_mag > ref_mag * 1e6 && ref_mag > 1e-10) {
-            iterations[idx] = 0xFFFFFFFE;
-            final_z2[idx] = 0.0f;
-            return;
-        }
-
-        delta_x = new_dx;
-        delta_y = new_dy;
-        iteration++;
-    }
-
-    // Mark glitch if pixel needs more iterations than reference
-    if (iteration >= params.ref_escape_iter && iteration < params.max_iter) {
-        iterations[idx] = 0xFFFFFFFE;
-        final_z2[idx] = 0.0f;
-        return;
-    }
-
-    iterations[idx] = iteration;
-    final_z2[idx] = z2;
-}
+// (The double-typed "perturbation V2 smooth" kernel was removed for the same
+// reason — see the note above. CPU replacement: perturb_cpu_tile + smooth
+// coloring in gpu.c / deep_render.c.)

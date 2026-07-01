@@ -161,6 +161,7 @@ target("mandelbrotplay_c")
     add_files("src/viewer/*.c")
     add_files("src/gpu/*.c")
     add_files("src/gpu/*.m")
+    add_files("src/perturbation/perturb_cpu.c")
 
     -- CMT Objective-C sources (compiled from package install dir)
     -- Disable ARC for all Objective-C files (CMT requires manual memory management)
@@ -186,6 +187,26 @@ target("mandelbrotplay_c")
     add_includedirs("src")
 
     -- Optimization
+    set_optimize("fastest")
+
+-- =============================================================================
+-- Unit Tests
+-- =============================================================================
+
+target("mandelbrot_tests")
+    set_kind("binary")
+    set_languages("c17")
+    add_rules("build_flags")
+    set_default(false)
+
+    add_files("tests/test_main.c")
+    add_files("src/mandelbrot/mandelbrot.c")
+    add_files("src/mandelbrot/mandelbrot_simd.c")
+    add_files("src/perturbation/*.c")
+    add_files("src/precision/*.c")
+
+    add_packages("gmp", "mpfr")
+    add_includedirs("src")
     set_optimize("fastest")
 
 -- =============================================================================

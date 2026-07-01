@@ -2,13 +2,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 // =============================================================================
 // Internal State
 // =============================================================================
 
-static uint64_t cache_hits = 0;
-static uint64_t cache_misses = 0;
+// Atomic: incremented under the cache lock but read lock-free by
+// tile_cache_stats, which may run on a different thread.
+static _Atomic uint64_t cache_hits = 0;
+static _Atomic uint64_t cache_misses = 0;
 
 // =============================================================================
 // Helper Functions

@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #define QOI_IMPLEMENTATION
 #define QOI_NO_STDIO
@@ -32,6 +33,7 @@ struct DiskCache {
     LRUEntry *lru_head;  // Most recently used
     LRUEntry *lru_tail;  // Least recently used
     pthread_mutex_t mutex;
+    _Atomic uint32_t variant;  // Render-settings fingerprint in tile paths
 };
 
 // =============================================================================
@@ -71,16 +73,25 @@ static int ensure_directory(const char *path) {
 }
 
 static void get_tile_path(const DiskCache *cache, const MapTile *tile, char *path, size_t path_size) {
-    snprintf(path, path_size, "%s/%d/%llu/%llu.qoi",
-             cache->base_path, tile->zoom,
+    snprintf(path, path_size, "%s/v%08x/%d/%llu/%llu.qoi",
+             cache->base_path,
+             atomic_load(&((DiskCache *)cache)->variant),
+             tile->zoom,
              (unsigned long long)tile->x,
              (unsigned long long)tile->y);
 }
 
 static void get_tile_dir(const DiskCache *cache, const MapTile *tile, char *path, size_t path_size) {
-    snprintf(path, path_size, "%s/%d/%llu",
-             cache->base_path, tile->zoom,
+    snprintf(path, path_size, "%s/v%08x/%d/%llu",
+             cache->base_path,
+             atomic_load(&((DiskCache *)cache)->variant),
+             tile->zoom,
              (unsigned long long)tile->x);
+}
+
+void disk_cache_set_variant(DiskCache *cache, uint32_t variant) {
+    if (!cache) return;
+    atomic_store(&cache->variant, variant);
 }
 
 // Convert PixelColor (RGB) to RGBA for QOI

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <math.h>
 
 // =============================================================================
 // Platform Detection
@@ -116,8 +117,64 @@ typedef struct {
 // Maximum string length for HP coordinates
 #define MB_HP_COORD_STR_LEN 512
 
-// Maximum zoom level with HP mode (log10 of zoom)
-#define MB_MAX_ZOOM_HP 200
+// =============================================================================
+// Zoom Limits (single source of truth for every clamp in the app)
+// =============================================================================
+//
+// The maximum zoom of 1e300 is the absolute limit of this architecture:
+// zoom_level and scale = (2/height)/zoom are doubles, and scale must remain
+// a normal double (>= DBL_MIN ~ 2.2e-308). At 1e300, scale ~ 1.9e-303 and
+// per-pixel deltas (~pixels * scale ~ 1e-300) are still normal doubles.
+// Zooming past ~1e304 would underflow scale to zero; removing the limit
+// entirely requires extended-exponent ("floatexp") delta arithmetic and
+// log-space zoom state.
+//
+// Correctness budget at 1e300:
+//  - View center: kept as decimal strings, updated with MPFR
+//    (mp_required_precision(1e300) = 2048 bits ~ 616 digits > 300+17 needed).
+//  - Reference orbits: computed per tile in MPFR at that precision.
+//  - Per-pixel deltas: pixel offsets from the tile-center reference times
+//    scale, exact in double.
+//  - Delta iteration: plain double with rebasing; the delta^2 term only
+//    underflows while it is negligible relative to delta_c, so results stay
+//    correct.
+
+#define MB_ZOOM_MIN 1.0
+#define MB_ZOOM_LOG10_MAX 300.0
+#define MB_ZOOM_MAX 1e300
+
+static inline double mb_clamp_zoom(double zoom) {
+    if (zoom < MB_ZOOM_MIN) return MB_ZOOM_MIN;
+    if (zoom > MB_ZOOM_MAX) return MB_ZOOM_MAX;
+    return zoom;
+}
+
+// Above this view zoom the z/x/y map-tile pyramid is abandoned for
+// screen-space perturbation tiles: map tile bounds are computed in double,
+// and at tile zoom ~41 (view zoom ~1.5e11) the per-pixel step inside a tile
+// drops below ~32 ulps of the coordinates, quantizing pixels.
+#define MB_DEEP_ZOOM_THRESHOLD 1e11
+
+// Iteration budget grows with zoom depth; boundary detail at zoom 10^N needs
+// roughly O(N) more iterations than the default view.
+static inline unsigned int mb_max_iter_for_zoom(double zoom) {
+    if (zoom <= 1.0) return MB_DEFAULT_MAX_ITER;
+    double log_zoom = log10(zoom);
+    double iters = (double)MB_DEFAULT_MAX_ITER + 200.0 * log_zoom;
+    if (iters > 150000.0) iters = 150000.0;
+    return (unsigned int)iters;
+}
+
+// Same budget for a map tile, derived from the view zoom whose pixel scale
+// matches that tile zoom: view_zoom ~= 2^(tile_zoom - 2.9) for a ~1080px
+// viewport, i.e. log10(view_zoom) ~= 0.301 * tile_zoom - 0.87.
+static inline unsigned int mb_max_iter_for_tile_zoom(int tile_zoom) {
+    double log_zoom = 0.301 * (double)tile_zoom - 0.87;
+    if (log_zoom < 0.0) log_zoom = 0.0;
+    double iters = (double)MB_DEFAULT_MAX_ITER + 200.0 * log_zoom;
+    if (iters > 150000.0) iters = 150000.0;
+    return (unsigned int)iters;
+}
 
 // Tile size for interactive rendering (256x256 pixels, ~64MB for 256 tiles)
 #define MB_INTERACTIVE_TILE_SIZE 256
@@ -140,7 +197,11 @@ typedef enum {
     MB_PALETTE_OCEAN = 2,       // Deep blue → Cyan → White
     MB_PALETTE_PLASMA = 3,      // Purple → Pink → Orange (cosine)
     MB_PALETTE_GRAYSCALE = 4,   // For analysis/export
-    MB_PALETTE_COUNT = 5
+    MB_PALETTE_ELECTRIC = 5,    // Cyan → Blue → Purple → Magenta (neon)
+    MB_PALETTE_SUNSET = 6,      // Deep red → Orange → Pink → Purple
+    MB_PALETTE_RAINBOW = 7,     // Full spectrum cycling
+    MB_PALETTE_FOREST = 8,      // Dark green → Lime → Yellow → Brown
+    MB_PALETTE_COUNT = 9
 } MBPaletteId;
 
 // Rendering state
@@ -148,6 +209,7 @@ typedef struct {
     MBColorMode color_mode;
     MBPaletteId palette_id;
     bool antialiasing_enabled;   // 2x2 supersampling
+    float color_cycle_scale;     // Color band density, default 64.0f, range [8.0 - 512.0]
 } MBRenderSettings;
 
 // =============================================================================
@@ -179,23 +241,34 @@ static inline void mb_view_state_init(MBViewState *view, int width, int height) 
     view->high_precision_mode = false;
 }
 
-// Pixel to complex plane coordinate mapping
+// Pixel to complex plane coordinate mapping.
+// Screen convention matches the viewer: py grows downward, imaginary axis
+// grows upward, so the top of the screen is center_y + half-height.
 static inline void mb_pixel_to_complex(
     const MBViewState *view, int px, int py,
     double *cx, double *cy) {
     // Scale based on viewport height to maintain aspect ratio
     double scale = (2.0 / view->viewport_height) / view->zoom_level;
     *cx = view->center_x + (px - view->viewport_width / 2.0) * scale;
-    *cy = view->center_y + (py - view->viewport_height / 2.0) * scale;
+    *cy = view->center_y - (py - view->viewport_height / 2.0) * scale;
 }
 
-// Complex to pixel coordinate mapping
+// Complex to pixel coordinate mapping (inverse of mb_pixel_to_complex)
 static inline void mb_complex_to_pixel(
     const MBViewState *view, double cx, double cy,
     int *px, int *py) {
     double scale = (2.0 / view->viewport_height) / view->zoom_level;
-    *px = (int)((cx - view->center_x) / scale + view->viewport_width / 2.0);
-    *py = (int)((cy - view->center_y) / scale + view->viewport_height / 2.0);
+    double fx = (cx - view->center_x) / scale + view->viewport_width / 2.0;
+    double fy = (view->center_y - cy) / scale + view->viewport_height / 2.0;
+    // Clamp before casting: at deep zoom an off-screen point can be
+    // astronomically many pixels away, and out-of-range double-to-int
+    // conversion is undefined behavior.
+    if (fx < -1e9) fx = -1e9;
+    if (fx > 1e9) fx = 1e9;
+    if (fy < -1e9) fy = -1e9;
+    if (fy > 1e9) fy = 1e9;
+    *px = (int)fx;
+    *py = (int)fy;
 }
 
 // Get the current scale (complex units per pixel)

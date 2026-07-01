@@ -26,19 +26,35 @@ typedef struct {
 // Predefined palette parameters
 static const CosinePalette kPalettes[] = {
     // CLASSIC - Approximation of original bit-mixing (warm earth tones)
-    {{0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.1f, 0.2f}},
+    // Tuned: Increased saturation for richer colors
+    {{0.5f, 0.5f, 0.5f}, {0.6f, 0.6f, 0.6f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.1f, 0.2f}},
 
     // FIRE - Black -> Red -> Orange -> Yellow -> White
-    {{0.5f, 0.2f, 0.0f}, {0.5f, 0.4f, 0.3f}, {1.0f, 0.7f, 0.4f}, {0.0f, 0.15f, 0.2f}},
+    // Tuned: Adjusted phase for later white, better progression
+    {{0.5f, 0.2f, 0.0f}, {0.5f, 0.5f, 0.4f}, {1.0f, 0.8f, 0.5f}, {0.0f, 0.1f, 0.25f}},
 
     // OCEAN - Deep blue -> Cyan -> White
-    {{0.2f, 0.4f, 0.6f}, {0.3f, 0.4f, 0.4f}, {1.0f, 1.0f, 0.5f}, {0.0f, 0.1f, 0.2f}},
+    // Tuned: More cyan transition, deeper blues
+    {{0.1f, 0.3f, 0.6f}, {0.4f, 0.5f, 0.4f}, {1.0f, 1.2f, 0.6f}, {0.0f, 0.15f, 0.25f}},
 
     // PLASMA - Purple -> Pink -> Orange
-    {{0.5f, 0.3f, 0.5f}, {0.5f, 0.4f, 0.5f}, {1.0f, 1.0f, 1.0f}, {0.8f, 0.9f, 0.3f}},
+    // Tuned: Better balance between purple and orange
+    {{0.5f, 0.3f, 0.5f}, {0.5f, 0.5f, 0.5f}, {1.0f, 0.8f, 1.0f}, {0.7f, 0.85f, 0.25f}},
 
-    // GRAYSCALE
+    // GRAYSCALE - For analysis/export
     {{0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.0f, 0.0f}},
+
+    // ELECTRIC - Cyan -> Blue -> Purple -> Magenta (neon, high contrast)
+    {{0.5f, 0.3f, 0.7f}, {0.5f, 0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {0.5f, 0.7f, 0.9f}},
+
+    // SUNSET - Deep red -> Orange -> Pink -> Purple (warm gradient)
+    {{0.6f, 0.3f, 0.4f}, {0.5f, 0.4f, 0.4f}, {0.8f, 0.6f, 1.0f}, {0.0f, 0.1f, 0.5f}},
+
+    // RAINBOW - Full spectrum cycling (equal frequency RGB)
+    {{0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 0.33f, 0.67f}},
+
+    // FOREST - Dark green -> Lime -> Yellow -> Brown (nature tones)
+    {{0.4f, 0.5f, 0.3f}, {0.3f, 0.5f, 0.3f}, {1.0f, 0.8f, 0.6f}, {0.2f, 0.0f, 0.3f}},
 };
 
 // Palette names for HUD display
@@ -47,7 +63,11 @@ static const char* const kPaletteNames[] = {
     "Fire",
     "Ocean",
     "Plasma",
-    "Grayscale"
+    "Grayscale",
+    "Electric",
+    "Sunset",
+    "Rainbow",
+    "Forest"
 };
 
 // =============================================================================
@@ -133,11 +153,13 @@ static inline void palette_get_color(const CosinePalette *palette,
  * @param smooth_iter Fractional iteration count
  * @param max_iter Maximum iteration limit (for black detection)
  * @param palette_id Palette to use
+ * @param color_cycle_scale Color band density (default 64.0f, lower = more bands)
  */
 static inline void color_from_smooth_iteration(PixelColor *pixel,
                                                 float smooth_iter,
                                                 unsigned int max_iter,
-                                                MBPaletteId palette_id) {
+                                                MBPaletteId palette_id,
+                                                float color_cycle_scale) {
     // Interior points are black
     if (smooth_iter >= (float)max_iter - 0.5f) {
         pixel->r = 0;
@@ -148,7 +170,7 @@ static inline void color_from_smooth_iteration(PixelColor *pixel,
 
     // Normalize to [0, 1] with wrapping for color cycling
     // Use log scale for better distribution at high iteration counts
-    float t = smooth_iter / 64.0f;  // Color cycle every 64 iterations
+    float t = smooth_iter / color_cycle_scale;  // Color cycle every N iterations
     t = t - floorf(t);  // Wrap to [0, 1]
 
     if (palette_id >= MB_PALETTE_COUNT) {
@@ -179,11 +201,18 @@ static inline void color_from_iteration_classic(PixelColor *pixel,
 /**
  * Apply palette to integer iteration count (no smooth coloring).
  * Uses palette color but with discrete steps.
+ *
+ * @param pixel Output pixel color
+ * @param iteration Integer iteration count
+ * @param max_iter Maximum iteration limit
+ * @param palette_id Palette to use
+ * @param color_cycle_scale Color band density (default 64.0f, lower = more bands)
  */
 static inline void color_from_iteration_palette(PixelColor *pixel,
                                                  unsigned int iteration,
                                                  unsigned int max_iter,
-                                                 MBPaletteId palette_id) {
+                                                 MBPaletteId palette_id,
+                                                 float color_cycle_scale) {
     if (iteration >= max_iter) {
         pixel->r = 0;
         pixel->g = 0;
@@ -192,7 +221,7 @@ static inline void color_from_iteration_palette(PixelColor *pixel,
     }
 
     // For non-smooth mode with palette, just use integer iteration
-    float t = (float)iteration / 64.0f;
+    float t = (float)iteration / color_cycle_scale;
     t = t - floorf(t);
 
     if (palette_id >= MB_PALETTE_COUNT) {

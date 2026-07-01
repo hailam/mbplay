@@ -10,10 +10,15 @@
 // =============================================================================
 //
 // Storage layout:
-//   {base_path}/{z}/{x}/{y}.qoi
+//   {base_path}/v{variant}/{z}/{x}/{y}.qoi
 //
 // Zoom 0-20: Disk cached
 // Zoom 21+:  Memory only (too many potential tiles)
+//
+// Tiles are stored post-colored, so the cache key must include everything
+// that affects the pixels: the `variant` component is a fingerprint of the
+// render settings (palette, color mode, cycle scale, iteration formula).
+// Without it, changing the palette would serve stale colors from disk.
 //
 // Uses QOI format for fast encoding/decoding.
 
@@ -30,6 +35,14 @@ typedef struct DiskCache DiskCache;
  * @return Initialized cache, or NULL on failure
  */
 DiskCache *disk_cache_init(const char *base_path, int64_t max_size_bytes);
+
+/**
+ * Set the render-settings variant used in tile paths.
+ * Call at startup and whenever render settings change.
+ * @param cache The disk cache
+ * @param variant Fingerprint of the settings that affect tile pixels
+ */
+void disk_cache_set_variant(DiskCache *cache, uint32_t variant);
 
 /**
  * Get a tile from disk cache.

@@ -44,10 +44,13 @@ static inline void color_from_iteration_ex(PixelColor *pixel,
                                            float final_z2,
                                            unsigned int max_iter,
                                            const MBRenderSettings *settings) {
+    // Use default cycle scale if not set (for backward compatibility)
+    float cycle_scale = settings->color_cycle_scale > 0.0f ? settings->color_cycle_scale : 64.0f;
+
     if (settings->color_mode == MB_COLOR_MODE_SMOOTH) {
         // Smooth coloring with palette
         float smooth = mb_compute_smooth_iteration(iteration, final_z2, max_iter);
-        color_from_smooth_iteration(pixel, smooth, max_iter, settings->palette_id);
+        color_from_smooth_iteration(pixel, smooth, max_iter, settings->palette_id, cycle_scale);
     } else {
         // Classic integer coloring
         if (settings->palette_id == MB_PALETTE_CLASSIC) {
@@ -55,7 +58,7 @@ static inline void color_from_iteration_ex(PixelColor *pixel,
             color_from_iteration_classic(pixel, iteration, max_iter);
         } else {
             // Other palette with discrete steps
-            color_from_iteration_palette(pixel, iteration, max_iter, settings->palette_id);
+            color_from_iteration_palette(pixel, iteration, max_iter, settings->palette_id, cycle_scale);
         }
     }
 }

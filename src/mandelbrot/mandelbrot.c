@@ -74,7 +74,8 @@ void mb_compute_tile_double(double center_x, double center_y, double scale,
             unsigned int iteration = mb_compute_point(cx, cy, (unsigned int)max_iter);
 
             // Convert to color
-            color_from_iteration(&output[ly * tile_size + lx], iteration);
+            color_from_iteration_classic(&output[ly * tile_size + lx], iteration,
+                                         (unsigned int)max_iter);
         }
     }
 }
