@@ -92,6 +92,17 @@ unsigned int mb_compute_point_smooth(double cx, double cy, unsigned int max_iter
                                      float *final_z2);
 
 /**
+ * Compute two points at once (NEON 2-lane on arm64, scalar fallback
+ * elsewhere), with smooth-coloring outputs. Iteration counts may differ from
+ * the scalar path by a small amount for chaotic boundary pixels (FMA
+ * rounding), just like any reordering of double arithmetic.
+ */
+void mb_compute_pair_smooth(double cx0, double cy0, double cx1, double cy1,
+                            unsigned int max_iter,
+                            unsigned int *iter0, unsigned int *iter1,
+                            float *z2_0, float *z2_1);
+
+/**
  * Compute a tile using double precision with smooth coloring support.
  *
  * @param center_x View center X in complex plane

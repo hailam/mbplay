@@ -387,22 +387,18 @@
     [_imagField setStringValue:[NSString stringWithFormat:@"%.15g", imag]];
 }
 
-- (void)updateZoomDisplay:(double)zoomLevel {
-    // Convert zoom to slider position (logarithmic)
-    double sliderValue = 0.0;
-    if (zoomLevel > 1.0) {
-        sliderValue = log10(zoomLevel) / ZOOM_LOG_MAX;
-        if (sliderValue > 1.0) sliderValue = 1.0;
-    }
+- (void)updateZoomDisplayLog10:(double)zoomLog10 {
+    // Slider position (linear in log10)
+    double sliderValue = zoomLog10 / ZOOM_LOG_MAX;
+    if (sliderValue < 0.0) sliderValue = 0.0;
+    if (sliderValue > 1.0) sliderValue = 1.0;
     [_zoomSlider setDoubleValue:sliderValue];
 
     // Update value label
-    if (zoomLevel >= 1e15) {
-        [_zoomValueLabel setStringValue:[NSString stringWithFormat:@"%.1e", zoomLevel]];
-    } else if (zoomLevel >= 1e6) {
-        [_zoomValueLabel setStringValue:[NSString stringWithFormat:@"%.2eX", zoomLevel]];
+    if (zoomLog10 >= 6.0) {
+        [_zoomValueLabel setStringValue:[NSString stringWithFormat:@"1e%.0fx", zoomLog10]];
     } else {
-        [_zoomValueLabel setStringValue:[NSString stringWithFormat:@"%.1fx", zoomLevel]];
+        [_zoomValueLabel setStringValue:[NSString stringWithFormat:@"%.1fx", pow(10.0, zoomLog10)]];
     }
 }
 

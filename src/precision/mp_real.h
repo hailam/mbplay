@@ -3,6 +3,7 @@
 
 #include <mpfr.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // =============================================================================
 // MPFR Wrapper for Arbitrary-Precision Real Numbers
@@ -145,6 +146,19 @@ int mp_real_cmp_d(const MPReal *x, double d);
 int mp_real_snprintf(char *buf, size_t n, const MPReal *x, int digits);
 
 /**
+ * Add an extended-exponent value: r = a + (m * 2^e).
+ * Exact regardless of exponent (unlike mp_real_add_d, which cannot receive
+ * values outside double range).
+ */
+void mp_real_add_fx(MPReal *r, const MPReal *a, double fx_m, int64_t fx_e);
+
+/**
+ * Get as extended-exponent value: *fx_m in +-[0.5,1) (or 0), value = m*2^e.
+ * Never overflows/underflows, unlike mp_real_get_d.
+ */
+void mp_real_get_fx(const MPReal *x, double *fx_m, int64_t *fx_e);
+
+/**
  * Clear/free memory used by MPReal.
  * @param x The MPReal to clear
  */
@@ -162,5 +176,11 @@ void mp_real_clear(MPReal *x);
  * @return Required precision in bits (minimum 64)
  */
 mpfr_prec_t mp_required_precision(double zoom_level);
+
+/**
+ * Same, from log10 of the zoom level — usable beyond double range
+ * (zoom 10^4000 needs ~13k bits; a double cannot hold 10^4000 itself).
+ */
+mpfr_prec_t mp_required_precision_log10(double zoom_log10);
 
 #endif // MB_MP_REAL_H

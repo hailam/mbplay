@@ -7,7 +7,9 @@
 #include "../src/mandelbrot/mandelbrot.h"
 #include "../src/perturbation/perturbation.h"
 #include "../src/perturbation/perturb_cpu.h"
+#include "../src/perturbation/bla.h"
 #include "../src/perturbation/deep_render.h"
+#include "../src/cinematic/director.h"
 #include "../src/precision/mp_real.h"
 #include "../src/precision/mp_complex.h"
 #include "../src/precision/view_hp.h"
@@ -353,6 +355,263 @@ static void test_pipeline_consistency_at_zoom_ceiling(void) {
     mb_deep_renderer_destroy(r);
 }
 
+// Direct MPFR iteration with an extended-exponent pixel offset (dc does not
+// fit a double past zoom ~1e300).
+static unsigned int direct_iterate_mpfr_fx(const char *cx_str, const char *cy_str,
+                                           FloatExp dcx, FloatExp dcy,
+                                           unsigned int max_iter, unsigned int prec) {
+    MPComplex c, z, z_new;
+    MPReal norm;
+    mp_complex_init_set_str(&c, cx_str, cy_str, prec);
+    mp_complex_init(&z, prec);
+    mp_complex_init(&z_new, prec);
+    mp_real_init(&norm, prec);
+
+    mp_real_add_fx(&c.re, &c.re, dcx.m, dcx.e);
+    mp_real_add_fx(&c.im, &c.im, dcy.m, dcy.e);
+
+    mp_complex_set_d(&z, 0.0, 0.0);
+
+    unsigned int iteration = 0;
+    while (iteration < max_iter) {
+        mp_complex_norm_sqr(&norm, &z);
+        if (mp_real_cmp_d(&norm, 4.0) >= 0) break;
+        mp_complex_mandelbrot_iter(&z_new, &z, &c);
+        mp_complex_set(&z, &z_new);
+        iteration++;
+    }
+
+    mp_complex_clear(&c);
+    mp_complex_clear(&z);
+    mp_complex_clear(&z_new);
+    mp_real_clear(&norm);
+    return iteration;
+}
+
+// Beyond double range entirely: render at zoom 10^500 and 10^1000 (floatexp
+// deltas, floatexp pixel phase) and check sampled pixels against MPFR.
+static void check_deep_consistency_at_log10(double zoom_l10, uint64_t gen) {
+    MBViewState view;
+    mb_view_state_init(&view, 512, 512);
+    mb_view_set_zoom_log10(&view, zoom_l10);
+    mb_view_hp_set_center(&view,
+                          "-0.743643887037158704752191506114774",
+                          "0.131825904205311970493132056385139");
+    view.high_precision_mode = true;
+
+    MBDeepRenderer *r = mb_deep_renderer_create();
+    CHECK(r != NULL, "renderer create failed");
+
+    MBRenderSettings settings = {
+        .color_mode = MB_COLOR_MODE_CLASSIC,
+        .palette_id = MB_PALETTE_CLASSIC,
+        .antialiasing_enabled = false,
+        .color_cycle_scale = 64.0f,
+    };
+
+    const int ts = 16;
+    const int tile_px = 248, tile_py = 248;
+    PixelColor *buf = malloc((size_t)ts * ts * sizeof(PixelColor));
+    CHECK(buf != NULL, "tile alloc failed");
+
+    unsigned int max_iter = 12000;
+    int rc = mb_deep_renderer_render_tile(r, &view, gen, tile_px, tile_py, ts,
+                                          max_iter, &settings, buf);
+    CHECK(rc == MB_DEEP_OK, "render_tile returned %d at 10^%.0f", rc, zoom_l10);
+
+    FloatExp scale = mb_view_get_scale_fx(&view);
+    unsigned int prec = (unsigned int)mp_required_precision_log10(zoom_l10);
+
+    const int samples[][2] = { {0, 0}, {15, 15}, {7, 3} };
+    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); i++) {
+        int lx = samples[i][0], ly = samples[i][1];
+        int px = tile_px + lx, py = tile_py + ly;
+        FloatExp dcx = fx_mul_d(scale, px - 256.0);
+        FloatExp dcy = fx_mul_d(scale, 256.0 - py);  // imaginary axis up
+
+        unsigned int it_m = direct_iterate_mpfr_fx(view.center_x_str, view.center_y_str,
+                                                   dcx, dcy, max_iter, prec);
+        PixelColor c = buf[(size_t)ly * ts + lx];
+
+        int matched = 0;
+        for (int d = -1; d <= 1 && !matched; d++) {
+            long candidate = (long)it_m + d;
+            if (candidate < 0) continue;
+            unsigned int it_c = (unsigned long)candidate > max_iter
+                                    ? max_iter : (unsigned int)candidate;
+            PixelColor expect;
+            color_from_iteration_classic(&expect, it_c, max_iter);
+            if (expect.r == c.r && expect.g == c.g && expect.b == c.b) matched = 1;
+        }
+        CHECK(matched,
+              "10^%.0f pixel (%d,%d): color (%u,%u,%u) vs MPFR iter=%u",
+              zoom_l10, lx, ly, c.r, c.g, c.b, it_m);
+    }
+
+    free(buf);
+    mb_deep_renderer_destroy(r);
+}
+
+static void test_pipeline_consistency_beyond_double_range(void) {
+    check_deep_consistency_at_log10(500.0, 1);
+    check_deep_consistency_at_log10(1000.0, 1);
+}
+
+#include <time.h>
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// BLA must not change results (within the +-1 escape-boundary tolerance) and
+// must actually skip work.
+static void test_bla_equivalence_and_speedup(void) {
+    const char *cx_str = "-0.743643887037158704752191506114774";
+    const char *cy_str = "0.131825904205311970493132056385139";
+    const double zoom = 1e30;
+    const unsigned int max_iter = 60000;
+    const unsigned int prec = (unsigned int)mp_required_precision(zoom);
+    const double scale = (2.0 / 1024.0) / zoom;
+
+    ReferenceOrbitHP orbit;
+    CHECK(ref_orbit_hp_init(&orbit, max_iter, prec) == 0, "hp orbit init failed");
+    ref_orbit_hp_compute(&orbit, cx_str, cy_str);
+    CHECK(orbit.valid, "hp orbit invalid");
+
+    uint32_t ref_len = orbit.escape_iter + 1;
+    if (ref_len > orbit.max_iter) ref_len = orbit.max_iter;
+
+    MBBlaTable bla;
+    FloatExp dc_max = fx_from_d(scale * 2000.0);
+    CHECK(mb_bla_build(&bla, orbit.z_real, orbit.z_imag, ref_len, dc_max) == 0,
+          "bla build failed");
+    CHECK(bla.entries != NULL && bla.levels > 8, "bla table degenerate");
+
+    const int N = 8;
+    uint32_t plain[N * N], fast[N * N];
+
+    double t0 = now_seconds();
+    for (int py = 0; py < N; py++) {
+        for (int px = 0; px < N; px++) {
+            double dcx = (px - N / 2) * 64.0 * scale;
+            double dcy = (py - N / 2) * 64.0 * scale;
+            plain[py * N + px] = perturb_cpu_pixel(orbit.z_real, orbit.z_imag,
+                                                   ref_len, dcx, dcy, max_iter, NULL);
+        }
+    }
+    double t1 = now_seconds();
+    for (int py = 0; py < N; py++) {
+        for (int px = 0; px < N; px++) {
+            double dcx = (px - N / 2) * 64.0 * scale;
+            double dcy = (py - N / 2) * 64.0 * scale;
+            fast[py * N + px] = perturb_cpu_pixel_bla(orbit.z_real, orbit.z_imag,
+                                                      ref_len, dcx, dcy, max_iter,
+                                                      &bla, NULL);
+        }
+    }
+    double t2 = now_seconds();
+
+    int exact = 0;
+    for (int i = 0; i < N * N; i++) {
+        uint32_t d = plain[i] > fast[i] ? plain[i] - fast[i] : fast[i] - plain[i];
+        if (d == 0) exact++;
+        CHECK(d <= 1, "pixel %d: plain=%u bla=%u", i, plain[i], fast[i]);
+    }
+    CHECK(exact * 100 >= N * N * 90, "only %d/%d exact matches with BLA", exact, N * N);
+
+    double plain_t = t1 - t0;
+    double bla_t = t2 - t1;
+    CHECK(bla_t * 2.0 < plain_t,
+          "BLA not faster: plain=%.3fs bla=%.3fs", plain_t, bla_t);
+    printf("  [bla] plain %.3fs, bla %.3fs (%.0fx speedup)\n",
+           plain_t, bla_t, plain_t / bla_t);
+
+    mb_bla_free(&bla);
+    ref_orbit_hp_cleanup(&orbit);
+}
+
+// Resuming an orbit at a larger budget must produce bit-identical results to
+// computing it fresh (same values, same rounding sequence).
+static void test_orbit_continuation(void) {
+    const char *cx_str = "-0.743643887037158704752191506114774";
+    const char *cy_str = "0.131825904205311970493132056385139";
+    const unsigned int prec = (unsigned int)mp_required_precision_log10(30.0);
+
+    ReferenceOrbitHP small, resumed, fresh;
+    CHECK(ref_orbit_hp_init(&small, 20000, prec) == 0, "init small");
+    ref_orbit_hp_compute(&small, cx_str, cy_str);
+    CHECK(small.valid && small.escape_iter == small.max_iter,
+          "expected a non-escaping reference (escape=%u)", small.escape_iter);
+    CHECK(small.cont_z != NULL, "continuation state missing");
+
+    CHECK(ref_orbit_hp_init(&resumed, 30000, prec) == 0, "init resumed");
+    CHECK(ref_orbit_hp_continue(&resumed, &small, NULL, NULL) == 0, "continue failed");
+
+    CHECK(ref_orbit_hp_init(&fresh, 30000, prec) == 0, "init fresh");
+    ref_orbit_hp_compute(&fresh, cx_str, cy_str);
+
+    CHECK(resumed.escape_iter == fresh.escape_iter, "escape_iter mismatch: %u vs %u",
+          resumed.escape_iter, fresh.escape_iter);
+    int mismatches = 0;
+    for (uint32_t i = 0; i < 30000 && mismatches < 5; i++) {
+        if (resumed.z_real[i] != fresh.z_real[i] || resumed.z_imag[i] != fresh.z_imag[i]) {
+            mismatches++;
+            CHECK(0, "orbit value differs at %u", i);
+        }
+    }
+
+    // Preconditions enforced: cannot continue into a smaller/equal budget
+    ReferenceOrbitHP tiny;
+    CHECK(ref_orbit_hp_init(&tiny, 10000, prec) == 0, "init tiny");
+    CHECK(ref_orbit_hp_continue(&tiny, &small, NULL, NULL) == -1,
+          "continue into smaller budget must fail");
+
+    ref_orbit_hp_cleanup(&small);
+    ref_orbit_hp_cleanup(&resumed);
+    ref_orbit_hp_cleanup(&fresh);
+    ref_orbit_hp_cleanup(&tiny);
+}
+
+// The paired (SIMD) iteration must statistically match the scalar path.
+// (FMA rounding differs, so chaotic boundary pixels may drift by a little —
+// the same tolerance philosophy as perturbation-vs-direct.)
+static void test_pair_matches_scalar(void) {
+    const double cx0 = -0.7436438870372, cy0 = 0.1318259043;
+    const double scale = 1e-9;
+    const unsigned int max_iter = 3000;
+
+    int total = 0, exact = 0, far = 0;
+    for (int py = 0; py < 16; py++) {
+        for (int px = 0; px < 16; px += 2) {
+            double ax = cx0 + (px - 8) * scale;
+            double bx = cx0 + (px - 7) * scale;
+            double y = cy0 + (py - 8) * scale;
+
+            unsigned int p0, p1;
+            float z0, z1;
+            mb_compute_pair_smooth(ax, y, bx, y, max_iter, &p0, &p1, &z0, &z1);
+
+            float sz;
+            unsigned int s0 = mb_compute_point_smooth(ax, y, max_iter, &sz);
+            unsigned int s1 = mb_compute_point_smooth(bx, y, max_iter, &sz);
+
+            total += 2;
+            if (p0 == s0) exact++;
+            else if ((p0 > s0 ? p0 - s0 : s0 - p0) > 2) far++;
+            if (p1 == s1) exact++;
+            else if ((p1 > s1 ? p1 - s1 : s1 - p1) > 2) far++;
+
+            // Interior verdicts must agree exactly
+            CHECK((p0 >= max_iter) == (s0 >= max_iter), "interior verdict differs (lane0)");
+            CHECK((p1 >= max_iter) == (s1 >= max_iter), "interior verdict differs (lane1)");
+        }
+    }
+    CHECK(exact * 100 >= total * 90, "pair vs scalar: only %d/%d exact", exact, total);
+    CHECK(far * 100 <= total * 3, "pair vs scalar: %d/%d far off", far, total);
+}
+
 // HP center translation must be exact beyond double precision.
 static void test_view_hp_translate(void) {
     MBViewState view;
@@ -434,24 +693,67 @@ static void test_view_hp_zoom_towards_fixed_point(void) {
 }
 
 static void test_zoom_clamps(void) {
-    CHECK(mb_clamp_zoom(0.25) == MB_ZOOM_MIN, "lower clamp");
-    CHECK(mb_clamp_zoom(1e299 * 10.0) == MB_ZOOM_MAX, "upper clamp");
-    CHECK(mb_clamp_zoom(12345.0) == 12345.0, "identity inside range");
+    CHECK(mb_clamp_zoom_log10(-3.0) == MB_ZOOM_LOG10_MIN, "lower clamp");
+    CHECK(mb_clamp_zoom_log10(99999.0) == MB_ZOOM_LOG10_MAX, "upper clamp");
+    CHECK(mb_clamp_zoom_log10(123.0) == 123.0, "identity inside range");
 
-    // The full budget must stay in normal double range
+    // At the ceiling, the FloatExp scale must stay exact and nonzero
     MBViewState view;
     mb_view_state_init(&view, 300, 300);  // smallest supported viewport
-    view.zoom_level = MB_ZOOM_MAX;
-    double scale = mb_view_get_scale(&view);
-    CHECK(scale > 0.0 && isnormal(scale), "scale degenerate at MB_ZOOM_MAX: %g", scale);
-    // Largest delta across a big viewport must be normal too
-    CHECK(isnormal(scale * 4000.0), "pixel delta degenerate at MB_ZOOM_MAX");
+    mb_view_set_zoom_log10(&view, MB_ZOOM_LOG10_MAX);
+    CHECK(view.zoom_level == MB_ZOOM_MIRROR_MAX, "mirror saturation");
+    CHECK(view.zoom_log10 == MB_ZOOM_LOG10_MAX, "log10 stored");
+
+    FloatExp scale = mb_view_get_scale_fx(&view);
+    CHECK(!fx_is_zero(scale), "fx scale zero at ceiling");
+    double l10 = fx_log10(scale);
+    // scale = (2/300) * 10^-4000 -> log10 ~ -4002.2
+    CHECK(fabs(l10 - (-4000.0 + log10(2.0 / 300.0))) < 0.01,
+          "fx scale magnitude wrong at ceiling: 10^%.2f", l10);
+}
+
+static void test_floatexp_arithmetic(void) {
+    // Round trips
+    CHECK(fx_to_d(fx_from_d(1.5)) == 1.5, "roundtrip 1.5");
+    CHECK(fx_to_d(fx_from_d(-3.25e-200)) == -3.25e-200, "roundtrip small");
+    CHECK(fx_to_d(fx_from_d(0.0)) == 0.0, "roundtrip zero");
+
+    // Arithmetic identities within double range
+    FloatExp a = fx_from_d(3.0), b = fx_from_d(-7.5);
+    CHECK(fx_to_d(fx_add(a, b)) == -4.5, "add");
+    CHECK(fx_to_d(fx_sub(a, b)) == 10.5, "sub");
+    CHECK(fx_to_d(fx_mul(a, b)) == -22.5, "mul");
+    CHECK(fx_to_d(fx_div(b, a)) == -2.5, "div");
+
+    // Beyond double range: 10^-1000 constructed, squared, and recovered
+    FloatExp tiny = fx_from_log10(-1000.0);
+    CHECK(fabs(fx_log10(tiny) + 1000.0) < 1e-9, "from_log10: 10^%.12f", fx_log10(tiny));
+    FloatExp tiny2 = fx_mul(tiny, tiny);
+    CHECK(fabs(fx_log10(tiny2) + 2000.0) < 1e-9, "mul beyond range");
+    CHECK(fx_to_d(tiny) == 0.0, "to_d underflow flush");
+
+    // Addition ordering: adding something 2^-100 smaller is absorbed
+    FloatExp one = fx_from_d(1.0);
+    FloatExp eps = fx_norm(1.0, -100);
+    CHECK(fx_to_d(fx_add(one, eps)) == 1.0, "absorption");
+    // ...but comparable magnitudes are exact
+    FloatExp x = fx_norm(1.0, -1030);   // 2^-1030 (subnormal-range value)
+    FloatExp y = fx_norm(1.0, -1031);
+    FloatExp s = fx_add(x, y);          // 1.5 * 2^-1030
+    CHECK(s.e == -1030 + 1 && fabs(s.m - 0.75) < 1e-15, "sub-double-range add");
+
+    // Comparisons
+    CHECK(fx_cmp_abs(tiny, tiny2) > 0, "cmp magnitudes");
+    CHECK(fx_ge_d(fx_from_d(4.0), 4.0), "ge equal");
+    CHECK(!fx_ge_d(tiny, 4.0), "ge small");
 }
 
 static void test_iteration_scaling(void) {
     CHECK(mb_max_iter_for_zoom(1.0) == MB_DEFAULT_MAX_ITER, "base iter");
     CHECK(mb_max_iter_for_zoom(1e12) > mb_max_iter_for_zoom(1e6), "monotonic");
-    CHECK(mb_max_iter_for_zoom(MB_ZOOM_MAX) <= 150000, "cap");
+    CHECK(mb_max_iter_for_zoom_log10(MB_ZOOM_LOG10_MAX) <= 500000, "cap");
+    CHECK(mb_max_iter_for_zoom_log10(20.0) == mb_max_iter_for_zoom(1e20),
+          "log10 variant consistent");
     CHECK(mb_max_iter_for_tile_zoom(40) > mb_max_iter_for_tile_zoom(10),
           "tile zoom monotonic");
 }
@@ -473,6 +775,124 @@ static void test_pixel_complex_orientation(void) {
           "roundtrip failed: (400,100) -> (%d,%d)", px, py);
 }
 
+// The cinematic director: keyframes render, bracket correctly, pipeline
+// bounds itself, and steering keeps producing non-degenerate frames.
+static void test_cinematic_director(void) {
+    MBRenderSettings settings = {
+        .color_mode = MB_COLOR_MODE_SMOOTH,
+        .palette_id = MB_PALETTE_FIRE,
+        .antialiasing_enabled = false,
+        .color_cycle_scale = 64.0f,
+    };
+
+    MBDirector *d = mb_director_create(192, 128, &settings);
+    CHECK(d != NULL, "director create failed");
+
+    MBViewState seed;
+    mb_view_state_init(&seed, 192, 128);
+    seed.center_x = -0.7436;
+    seed.center_y = 0.1318;
+    mb_view_hp_sync_from_doubles(&seed);
+    mb_view_set_zoom_log10(&seed, 3.0);
+    mb_director_start(d, &seed);
+
+    int k0 = mb_director_render_next(d);
+    CHECK(k0 >= 0, "first keyframe failed");
+    int k1 = mb_director_render_next(d);
+    CHECK(k1 == k0 + 1, "keyframe indices not sequential: %d after %d", k1, k0);
+    mb_director_render_next(d);
+
+    // Bracketing lookup mid-way between the first two keyframes
+    double z = (k0 + 0.5) * MB_CINE_STEP;
+    const MBCineKeyframe *lo = NULL, *hi = NULL;
+    mb_director_lock_frames(d, z, &lo, &hi);
+    CHECK(lo && lo->index == k0, "lo keyframe missing/wrong");
+    CHECK(hi && hi->index == k0 + 1, "hi keyframe missing/wrong");
+    int nonblack = 0;
+    if (lo) {
+        for (int i = 0; i < 192 * 128; i++) {
+            if (lo->pixels[i].r || lo->pixels[i].g || lo->pixels[i].b) nonblack++;
+        }
+    }
+    mb_director_unlock_frames(d);
+    CHECK(nonblack > 100, "keyframe nearly black (%d colored px)", nonblack);
+
+    CHECK(mb_director_ready_log10(d) >= (k0 + 3) * MB_CINE_STEP - 1e-9,
+          "ready watermark wrong: %f", mb_director_ready_log10(d));
+
+    // The pipeline must self-limit to MB_CINE_AHEAD past playback
+    int guard = 0;
+    while (mb_director_render_next(d) >= 0 && guard < 20) guard++;
+    CHECK(guard < 20, "pipeline never reported full");
+
+    mb_director_destroy(d);
+}
+
+// Void regression: an autopilot dive must keep the set boundary in frame at
+// every keyframe — i.e. every keyframe's view contains BOTH interior and
+// escaping points. (The original steering chased any high count and could
+// wander into pure-exterior voids or dive into the interior.)
+static void test_cinematic_dive_stays_on_boundary(void) {
+    MBRenderSettings settings = {
+        .color_mode = MB_COLOR_MODE_CLASSIC,
+        .palette_id = MB_PALETTE_CLASSIC,
+        .antialiasing_enabled = false,
+        .color_cycle_scale = 64.0f,
+    };
+
+    const int W = 192, H = 128;
+    MBDirector *d = mb_director_create(W, H, &settings);
+    CHECK(d != NULL, "director create failed");
+
+    MBViewState seed;
+    mb_view_state_init(&seed, W, H);   // default full-set view
+    mb_director_start(d, &seed);
+
+    MBDeepRenderer *checker = mb_deep_renderer_create();
+    CHECK(checker != NULL, "checker renderer failed");
+    uint32_t probe[24 * 24];
+
+    const int DIVE = 25;   // ~7.5 decades of autopilot
+    for (int step = 0; step < DIVE; step++) {
+        // Advance playback so the pipeline never reports full
+        const MBCineKeyframe *lo = NULL, *hi = NULL;
+        mb_director_lock_frames(d, step * MB_CINE_STEP, &lo, &hi);
+        mb_director_unlock_frames(d);
+
+        int k = mb_director_render_next(d);
+        CHECK(k == step, "keyframe %d failed (got %d)", step, k);
+        if (k != step) break;
+
+        // Inspect the keyframe's view: both classes must be present
+        mb_director_lock_frames(d, k * MB_CINE_STEP, &lo, &hi);
+        CHECK(lo && lo->index == k, "keyframe %d not retrievable", k);
+        MBViewState v = lo->view;
+        mb_director_unlock_frames(d);
+
+        uint32_t max_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&v));
+        int span = W < H ? W : H;
+        int probe_size = span - (span % 24);
+        int rc = mb_deep_renderer_probe_strided(checker, &v, (uint64_t)(k + 1),
+                                                (W - probe_size) / 2,
+                                                (H - probe_size) / 2,
+                                                probe_size, probe_size / 24,
+                                                max_iter, probe);
+        CHECK(rc == MB_DEEP_OK, "probe failed at keyframe %d", k);
+
+        int interior = 0, escaped = 0;
+        for (int i = 0; i < 24 * 24; i++) {
+            if (probe[i] >= max_iter) interior++;
+            else escaped++;
+        }
+        CHECK(interior > 0 && escaped > 0,
+              "keyframe %d lost the boundary (interior=%d escaped=%d, zoom 10^%.1f)",
+              k, interior, escaped, mb_view_zoom_log10(&v));
+    }
+
+    mb_deep_renderer_destroy(checker);
+    mb_director_destroy(d);
+}
+
 static void test_interior_black_with_custom_max_iter(void) {
     PixelColor p = {1, 2, 3};
     color_from_iteration_classic(&p, 500, 500);
@@ -486,11 +906,18 @@ int main(void) {
     test_perturb_matches_mpfr_at_1e30();
     test_deep_renderer_end_to_end();
     test_pipeline_consistency_at_zoom_ceiling();
+    test_floatexp_arithmetic();
+    test_pipeline_consistency_beyond_double_range();
+    test_bla_equivalence_and_speedup();
+    test_orbit_continuation();
+    test_pair_matches_scalar();
     test_view_hp_translate();
     test_view_hp_zoom_towards_fixed_point();
     test_zoom_clamps();
     test_iteration_scaling();
     test_pixel_complex_orientation();
+    test_cinematic_director();
+    test_cinematic_dive_stays_on_boundary();
     test_interior_black_with_custom_max_iter();
 
     printf("%d checks, %d failed\n", tests_run, tests_failed);

@@ -78,10 +78,10 @@
 - (void)setCoordinateReal:(double)real imag:(double)imag;
 
 /**
- * Update zoom display slider.
- * Call this when zoom level changes.
+ * Update zoom display slider (log10 of the zoom level — 10^4000 does not
+ * fit in a double). Call this when zoom level changes.
  */
-- (void)updateZoomDisplay:(double)zoomLevel;
+- (void)updateZoomDisplayLog10:(double)zoomLog10;
 
 /**
  * Update animation speed slider value (for initial sync)

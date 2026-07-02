@@ -94,6 +94,75 @@ int ref_orbit_hp_init(ReferenceOrbitHP *orbit, uint32_t max_iter, uint32_t preci
 }
 
 void ref_orbit_hp_compute(ReferenceOrbitHP *orbit, const char *cx_str, const char *cy_str) {
+    ref_orbit_hp_compute_cancellable(orbit, cx_str, cy_str, NULL, NULL);
+}
+
+static void hp_drop_cont_state(ReferenceOrbitHP *orbit) {
+    if (orbit->cont_z) {
+        mp_complex_clear(orbit->cont_z);
+        free(orbit->cont_z);
+        orbit->cont_z = NULL;
+    }
+}
+
+// The hot loop, shared by fresh computes and continuations. zr/zi hold the
+// current z, zr2/zi2 its component squares (maintained incrementally so the
+// escape test reuses the iteration's squarings — the naive form squared z a
+// second time for the norm and copied z twice per step, ~40% more MPFR work).
+// On a non-escaped, non-aborted run the final z is kept as continuation state.
+static void hp_orbit_run(ReferenceOrbitHP *orbit,
+                         mpfr_t zr, mpfr_t zi, mpfr_t zr2, mpfr_t zi2,
+                         mpfr_t cr, mpfr_t ci, mpfr_t tmp,
+                         uint32_t start_iter,
+                         bool (*should_abort)(void *ctx), void *ctx) {
+    uint32_t iteration = start_iter;
+    bool aborted = false;
+
+    while (iteration < orbit->max_iter) {
+        orbit->z_real[iteration] = mpfr_get_d(zr, MPFR_RNDN);
+        orbit->z_imag[iteration] = mpfr_get_d(zi, MPFR_RNDN);
+
+        // Escape: |z|^2 = zr2 + zi2 >= 4
+        mpfr_add(tmp, zr2, zi2, MPFR_RNDN);
+        if (mpfr_cmp_ui(tmp, 4) >= 0) {
+            break;
+        }
+
+        // z' = z^2 + c, reusing the maintained squares
+        mpfr_mul(tmp, zr, zi, MPFR_RNDN);       // zr*zi (old values)
+        mpfr_sub(zr, zr2, zi2, MPFR_RNDN);
+        mpfr_add(zr, zr, cr, MPFR_RNDN);
+        mpfr_mul_2ui(zi, tmp, 1, MPFR_RNDN);
+        mpfr_add(zi, zi, ci, MPFR_RNDN);
+        mpfr_sqr(zr2, zr, MPFR_RNDN);
+        mpfr_sqr(zi2, zi, MPFR_RNDN);
+
+        iteration++;
+
+        if (should_abort && (iteration & 0xFF) == 0 && should_abort(ctx)) {
+            aborted = true;
+            break;
+        }
+    }
+
+    orbit->escape_iter = iteration;
+    orbit->valid = !aborted;
+
+    hp_drop_cont_state(orbit);
+    if (!aborted && iteration >= orbit->max_iter) {
+        // Non-escaped: keep the exact final z so a deeper budget can resume
+        orbit->cont_z = (MPComplex *)malloc(sizeof(MPComplex));
+        if (orbit->cont_z) {
+            mp_complex_init(orbit->cont_z, orbit->precision);
+            mpfr_set(orbit->cont_z->re.value, zr, MPFR_RNDN);
+            mpfr_set(orbit->cont_z->im.value, zi, MPFR_RNDN);
+        }
+    }
+}
+
+void ref_orbit_hp_compute_cancellable(ReferenceOrbitHP *orbit,
+                                      const char *cx_str, const char *cy_str,
+                                      bool (*should_abort)(void *ctx), void *ctx) {
     if (!orbit->z_real || !orbit->z_imag) {
         return;
     }
@@ -106,51 +175,64 @@ void ref_orbit_hp_compute(ReferenceOrbitHP *orbit, const char *cx_str, const cha
 
     mpfr_prec_t prec = orbit->precision;
 
-    // Initialize HP complex numbers
-    MPComplex c, z, z_new;
-    MPReal norm_sqr;
+    mpfr_t zr, zi, zr2, zi2, cr, ci, tmp;
+    mpfr_inits2(prec, zr, zi, zr2, zi2, cr, ci, tmp, (mpfr_ptr)0);
 
-    mp_complex_init_set_str(&c, cx_str, cy_str, prec);
-    mp_complex_init(&z, prec);
-    mp_complex_init(&z_new, prec);
-    mp_real_init(&norm_sqr, prec);
+    mpfr_set_str(cr, cx_str, 10, MPFR_RNDN);
+    mpfr_set_str(ci, cy_str, 10, MPFR_RNDN);
 
     // Store double approximation of reference C
-    orbit->ref_cx = mp_complex_get_re_d(&c);
-    orbit->ref_cy = mp_complex_get_im_d(&c);
+    orbit->ref_cx = mpfr_get_d(cr, MPFR_RNDN);
+    orbit->ref_cy = mpfr_get_d(ci, MPFR_RNDN);
 
-    // z = 0
-    mp_complex_set_d(&z, 0.0, 0.0);
+    // z = 0 (squares included)
+    mpfr_set_ui(zr, 0, MPFR_RNDN);
+    mpfr_set_ui(zi, 0, MPFR_RNDN);
+    mpfr_set_ui(zr2, 0, MPFR_RNDN);
+    mpfr_set_ui(zi2, 0, MPFR_RNDN);
 
-    uint32_t iteration = 0;
+    hp_orbit_run(orbit, zr, zi, zr2, zi2, cr, ci, tmp, 0, should_abort, ctx);
 
-    // Mandelbrot iteration: z = z^2 + c
-    while (iteration < orbit->max_iter) {
-        // Store current z as double for GPU upload
-        orbit->z_real[iteration] = mp_complex_get_re_d(&z);
-        orbit->z_imag[iteration] = mp_complex_get_im_d(&z);
+    mpfr_clears(zr, zi, zr2, zi2, cr, ci, tmp, (mpfr_ptr)0);
+}
 
-        // Check escape: |z|^2 >= 4
-        mp_complex_norm_sqr(&norm_sqr, &z);
-        if (mp_real_cmp_d(&norm_sqr, 4.0) >= 0) {
-            break;
-        }
+int ref_orbit_hp_continue(ReferenceOrbitHP *dst, const ReferenceOrbitHP *src,
+                          bool (*should_abort)(void *ctx), void *ctx) {
+    if (!dst || !src || !dst->z_real || !dst->z_imag) return -1;
+    if (!src->valid || !src->cont_z) return -1;
+    if (src->escape_iter < src->max_iter) return -1;   // escaped: nothing to resume
+    if (dst->precision != src->precision) return -1;
+    if (dst->max_iter <= src->max_iter) return -1;
 
-        // z_new = z^2 + c
-        mp_complex_mandelbrot_iter(&z_new, &z, &c);
-        mp_complex_set(&z, &z_new);
+    // Carry the reference identity and the already-computed iterations
+    memcpy(dst->ref_cx_str, src->ref_cx_str, MB_HP_COORD_STR_LEN);
+    memcpy(dst->ref_cy_str, src->ref_cy_str, MB_HP_COORD_STR_LEN);
+    dst->ref_cx = src->ref_cx;
+    dst->ref_cy = src->ref_cy;
+    memcpy(dst->z_real, src->z_real, (size_t)src->max_iter * sizeof(double));
+    memcpy(dst->z_imag, src->z_imag, (size_t)src->max_iter * sizeof(double));
 
-        iteration++;
-    }
+    mpfr_prec_t prec = dst->precision;
 
-    orbit->escape_iter = iteration;
-    orbit->valid = true;
+    mpfr_t zr, zi, zr2, zi2, cr, ci, tmp;
+    mpfr_inits2(prec, zr, zi, zr2, zi2, cr, ci, tmp, (mpfr_ptr)0);
 
-    // Cleanup MPFR resources
-    mp_complex_clear(&c);
-    mp_complex_clear(&z);
-    mp_complex_clear(&z_new);
-    mp_real_clear(&norm_sqr);
+    // Same strings at the same precision parse to the identical value the
+    // original run used.
+    mpfr_set_str(cr, src->ref_cx_str, 10, MPFR_RNDN);
+    mpfr_set_str(ci, src->ref_cy_str, 10, MPFR_RNDN);
+
+    mpfr_set(zr, src->cont_z->re.value, MPFR_RNDN);
+    mpfr_set(zi, src->cont_z->im.value, MPFR_RNDN);
+    mpfr_sqr(zr2, zr, MPFR_RNDN);
+    mpfr_sqr(zi2, zi, MPFR_RNDN);
+
+    hp_orbit_run(dst, zr, zi, zr2, zi2, cr, ci, tmp,
+                 src->max_iter, should_abort, ctx);
+
+    mpfr_clears(zr, zi, zr2, zi2, cr, ci, tmp, (mpfr_ptr)0);
+
+    return dst->valid ? 0 : -1;
 }
 
 void ref_orbit_hp_cleanup(ReferenceOrbitHP *orbit) {
@@ -162,6 +244,7 @@ void ref_orbit_hp_cleanup(ReferenceOrbitHP *orbit) {
         free(orbit->z_imag);
         orbit->z_imag = NULL;
     }
+    hp_drop_cont_state(orbit);
     orbit->valid = false;
 }
 

@@ -38,4 +38,11 @@ void native_viewer_shutdown(void);
  */
 MBViewState* native_viewer_get_state(void);
 
+/**
+ * Start the cinematic autopilot zoom (equivalent to pressing V).
+ * Call after native_viewer_init, before or during native_viewer_run.
+ * @param decades_per_second Zoom speed (clamped to [0.05, 4.0])
+ */
+void native_viewer_start_cinematic(double decades_per_second);
+
 #endif // MB_NATIVE_VIEWER_H

@@ -2,6 +2,7 @@
 #define MB_PERTURBATION_H
 
 #include "../config.h"
+#include "../precision/mp_complex.h"
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -39,6 +40,12 @@ typedef struct {
     uint32_t max_iter;          // Maximum iterations allocated
     uint32_t precision;         // Bits of precision used for computation
     bool valid;
+
+    // Continuation state: final z of a non-escaped orbit (heap-allocated),
+    // so a later, deeper iteration budget at the same center can RESUME
+    // instead of recomputing from iteration zero. NULL when the orbit
+    // escaped, was aborted, or has not been computed.
+    MPComplex *cont_z;
 } ReferenceOrbitHP;
 
 /**
@@ -85,6 +92,29 @@ int ref_orbit_hp_init(ReferenceOrbitHP *orbit, uint32_t max_iter, uint32_t preci
  * @param cy_str Imaginary part as decimal string
  */
 void ref_orbit_hp_compute(ReferenceOrbitHP *orbit, const char *cx_str, const char *cy_str);
+
+/**
+ * Abortable variant: should_abort(ctx) is polled every few hundred
+ * iterations; returning true stops the computation and leaves the orbit
+ * invalid. A deep orbit (500k iterations at 16k-bit precision) can take tens
+ * of seconds — the caller must be able to cancel it when the view moves on.
+ */
+void ref_orbit_hp_compute_cancellable(ReferenceOrbitHP *orbit,
+                                      const char *cx_str, const char *cy_str,
+                                      bool (*should_abort)(void *ctx), void *ctx);
+
+/**
+ * Resume a non-escaped orbit at a larger iteration budget: copies src's
+ * stored iterations into dst and appends only the new ones from src's saved
+ * MPFR state. Requirements: dst initialized with the SAME precision and a
+ * LARGER max_iter; src valid, non-escaped, with continuation state; both
+ * describe the same center (caller's responsibility — compare the parsed
+ * values, not the strings, which gain digits as the zoom deepens).
+ * Returns 0 on success, -1 if the preconditions do not hold or the
+ * computation was aborted.
+ */
+int ref_orbit_hp_continue(ReferenceOrbitHP *dst, const ReferenceOrbitHP *src,
+                          bool (*should_abort)(void *ctx), void *ctx);
 
 /**
  * Free high-precision orbit arrays and MPFR resources.

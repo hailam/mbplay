@@ -15,9 +15,10 @@
 /**
  * Called when user drags the zoom slider.
  * @param slider The zoom slider overlay
- * @param zoomLevel The requested zoom level (MB_ZOOM_MIN to MB_ZOOM_MAX)
+ * @param zoomLog10 The requested zoom level as log10 (0 to MB_ZOOM_LOG10_MAX).
+ *                  Log form: 10^4000 does not fit in a double.
  */
-- (void)zoomSliderOverlay:(MBZoomSliderOverlay *)slider didChangeZoomLevel:(double)zoomLevel;
+- (void)zoomSliderOverlay:(MBZoomSliderOverlay *)slider didChangeZoomLog10:(double)zoomLog10;
 
 /**
  * Called when user scrolls over the zoom slider for fine adjustment.
@@ -68,10 +69,10 @@
 - (instancetype)initWithFrame:(NSRect)frameRect;
 
 /**
- * Update zoom display from external source.
+ * Update zoom display from external source (log10 of the zoom level).
  * Does NOT trigger delegate callback.
  */
-- (void)updateZoomLevel:(double)zoomLevel;
+- (void)updateZoomLog10:(double)zoomLog10;
 
 /**
  * Show the slider with fade-in animation.

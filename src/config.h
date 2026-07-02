@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <math.h>
+#include "precision/floatexp.h"
 
 // =============================================================================
 // Platform Detection
@@ -114,39 +115,39 @@ typedef struct {
 #define MB_PREC_TIER_3 512   // zoom 1e60 - 1e120
 #define MB_PREC_TIER_4 1024  // zoom > 1e120
 
-// Maximum string length for HP coordinates
-#define MB_HP_COORD_STR_LEN 512
+// Maximum string length for HP coordinates.
+// Must hold zoom_log10 + ~28 significant digits plus sign/point/exponent;
+// 4096 covers the MB_ZOOM_LOG10_MAX = 4000 ceiling.
+#define MB_HP_COORD_STR_LEN 4096
 
 // =============================================================================
 // Zoom Limits (single source of truth for every clamp in the app)
 // =============================================================================
 //
-// The maximum zoom of 1e300 is the absolute limit of this architecture:
-// zoom_level and scale = (2/height)/zoom are doubles, and scale must remain
-// a normal double (>= DBL_MIN ~ 2.2e-308). At 1e300, scale ~ 1.9e-303 and
-// per-pixel deltas (~pixels * scale ~ 1e-300) are still normal doubles.
-// Zooming past ~1e304 would underflow scale to zero; removing the limit
-// entirely requires extended-exponent ("floatexp") delta arithmetic and
-// log-space zoom state.
+// The zoom level lives in LOG10 SPACE (MBViewState.zoom_log10): a plain
+// double zoom would cap at ~1e304 where scale = (2/height)/zoom underflows.
+// Scales and per-pixel deltas beyond double range use extended-exponent
+// arithmetic (FloatExp, precision/floatexp.h), and the perturbation loop has
+// a floatexp phase for deltas below double range.
 //
-// Correctness budget at 1e300:
-//  - View center: kept as decimal strings, updated with MPFR
-//    (mp_required_precision(1e300) = 2048 bits ~ 616 digits > 300+17 needed).
-//  - Reference orbits: computed per tile in MPFR at that precision.
-//  - Per-pixel deltas: pixel offsets from the tile-center reference times
-//    scale, exact in double.
-//  - Delta iteration: plain double with rebasing; the delta^2 term only
-//    underflows while it is negligible relative to delta_c, so results stay
-//    correct.
+// The 10^4000 ceiling is pragmatic, not architectural: the center strings
+// need ~zoom_log10 + 12 digits (MB_HP_COORD_STR_LEN bounds them), MPFR
+// precision grows to ~13.4k bits, and iteration budgets at that depth are
+// what actually limit exploration. Raise MB_ZOOM_LOG10_MAX and
+// MB_HP_COORD_STR_LEN together if deeper is ever wanted.
+//
+// zoom_level remains as a SATURATING double mirror (capped at 1e300) for
+// shallow-zoom code paths and display; all deep logic derives from
+// zoom_log10 via the helpers below.
 
-#define MB_ZOOM_MIN 1.0
-#define MB_ZOOM_LOG10_MAX 300.0
-#define MB_ZOOM_MAX 1e300
+#define MB_ZOOM_LOG10_MIN 0.0
+#define MB_ZOOM_LOG10_MAX 4000.0
+#define MB_ZOOM_MIRROR_MAX 1e300
 
-static inline double mb_clamp_zoom(double zoom) {
-    if (zoom < MB_ZOOM_MIN) return MB_ZOOM_MIN;
-    if (zoom > MB_ZOOM_MAX) return MB_ZOOM_MAX;
-    return zoom;
+static inline double mb_clamp_zoom_log10(double l10) {
+    if (l10 < MB_ZOOM_LOG10_MIN) return MB_ZOOM_LOG10_MIN;
+    if (l10 > MB_ZOOM_LOG10_MAX) return MB_ZOOM_LOG10_MAX;
+    return l10;
 }
 
 // Above this view zoom the z/x/y map-tile pyramid is abandoned for
@@ -154,15 +155,21 @@ static inline double mb_clamp_zoom(double zoom) {
 // and at tile zoom ~41 (view zoom ~1.5e11) the per-pixel step inside a tile
 // drops below ~32 ulps of the coordinates, quantizing pixels.
 #define MB_DEEP_ZOOM_THRESHOLD 1e11
+#define MB_DEEP_ZOOM_LOG10 11.0
 
 // Iteration budget grows with zoom depth; boundary detail at zoom 10^N needs
-// roughly O(N) more iterations than the default view.
+// roughly O(N) more iterations than the default view. The cap is what BLA
+// iteration-skipping makes affordable.
+static inline unsigned int mb_max_iter_for_zoom_log10(double zoom_log10) {
+    if (zoom_log10 <= 0.0) return MB_DEFAULT_MAX_ITER;
+    double iters = (double)MB_DEFAULT_MAX_ITER + 200.0 * zoom_log10;
+    if (iters > 500000.0) iters = 500000.0;
+    return (unsigned int)iters;
+}
+
 static inline unsigned int mb_max_iter_for_zoom(double zoom) {
     if (zoom <= 1.0) return MB_DEFAULT_MAX_ITER;
-    double log_zoom = log10(zoom);
-    double iters = (double)MB_DEFAULT_MAX_ITER + 200.0 * log_zoom;
-    if (iters > 150000.0) iters = 150000.0;
-    return (unsigned int)iters;
+    return mb_max_iter_for_zoom_log10(log10(zoom));
 }
 
 // Same budget for a map tile, derived from the view zoom whose pixel scale
@@ -218,7 +225,8 @@ typedef struct {
 
 typedef struct {
     double center_x, center_y;  // Complex plane center (double precision, for display/UI)
-    double zoom_level;          // 1.0 = default view, higher = zoomed in
+    double zoom_level;          // SATURATING mirror of 10^zoom_log10 (caps at 1e300)
+    double zoom_log10;          // Source of truth for the zoom level (log10)
     int viewport_width;
     int viewport_height;
 
@@ -228,10 +236,26 @@ typedef struct {
     bool high_precision_mode;   // True when zoom exceeds HP threshold
 } MBViewState;
 
+// Read the log10 zoom; falls back to the double mirror for code (and tests)
+// that set zoom_level directly.
+static inline double mb_view_zoom_log10(const MBViewState *view) {
+    if (view->zoom_log10 > 0.0) return view->zoom_log10;
+    if (view->zoom_level > 1.0) return log10(view->zoom_level);
+    return 0.0;
+}
+
+// The only sanctioned way to change the zoom level.
+static inline void mb_view_set_zoom_log10(MBViewState *view, double l10) {
+    l10 = mb_clamp_zoom_log10(l10);
+    view->zoom_log10 = l10;
+    view->zoom_level = l10 >= 300.0 ? MB_ZOOM_MIRROR_MAX : pow(10.0, l10);
+}
+
 static inline void mb_view_state_init(MBViewState *view, int width, int height) {
     view->center_x = -0.5;
     view->center_y = 0.0;
     view->zoom_level = 1.0;
+    view->zoom_log10 = 0.0;
     view->viewport_width = width;
     view->viewport_height = height;
 
@@ -271,9 +295,17 @@ static inline void mb_complex_to_pixel(
     *py = (int)fy;
 }
 
-// Get the current scale (complex units per pixel)
+// Get the current scale (complex units per pixel) as a double.
+// SATURATES below ~1e-303: only valid for shallow-zoom code paths
+// (zoom < MB_DEEP_ZOOM_THRESHOLD); deep paths must use the FloatExp variant.
 static inline double mb_view_get_scale(const MBViewState *view) {
     return (2.0 / view->viewport_height) / view->zoom_level;
+}
+
+// Scale as extended-exponent value — exact at any zoom depth.
+static inline FloatExp mb_view_get_scale_fx(const MBViewState *view) {
+    FloatExp inv_zoom = fx_from_log10(-mb_view_zoom_log10(view));
+    return fx_mul_d(inv_zoom, 2.0 / view->viewport_height);
 }
 
 // Check if we need high-precision mode at current zoom level

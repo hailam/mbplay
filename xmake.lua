@@ -153,6 +153,9 @@ target("mandelbrotplay_c")
     set_kind("binary")
     set_languages("c17", "c++17")
     add_rules("metal2header", "build_flags")
+    -- Not a default target so bare `xmake run` opens only the viewer;
+    -- still built by default because mandelbrot_interactive depends on it.
+    set_default(false)
 
     -- Core C sources
     add_files("src/*.c")
@@ -204,6 +207,7 @@ target("mandelbrot_tests")
     add_files("src/mandelbrot/mandelbrot_simd.c")
     add_files("src/perturbation/*.c")
     add_files("src/precision/*.c")
+    add_files("src/cinematic/*.c")
 
     add_packages("gmp", "mpfr")
     add_includedirs("src")
@@ -217,6 +221,9 @@ target("mandelbrot_interactive")
     set_kind("binary")
     set_languages("c17", "c++17")
     add_rules("metal2header", "build_flags")
+    -- Build-order dependency only (binaries don't link each other): keeps
+    -- the CLI building on plain `xmake` while `xmake run` targets just this.
+    add_deps("mandelbrotplay_c")
 
     -- Main entry point
     add_files("src/viewer_native/main_interactive.c")
@@ -233,6 +240,7 @@ target("mandelbrot_interactive")
     add_files("src/compute/*.c")
     add_files("src/perturbation/*.c")
     add_files("src/precision/*.c")
+    add_files("src/cinematic/*.c")
 
     -- CMT Objective-C sources (compiled from package install dir)
     on_load(function (target)

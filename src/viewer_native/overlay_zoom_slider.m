@@ -213,17 +213,17 @@
 - (void)sliderChanged:(id)sender {
     (void)sender;
 
-    // Convert log slider value to actual zoom
+    // The slider value IS log10 of the zoom (pow(10, x) would overflow a
+    // double past x = 308).
     double logValue = [_slider doubleValue];
-    double zoomLevel = pow(10.0, logValue);
 
     // Update label
-    [self updateLabelForZoom:zoomLevel];
+    [self updateLabelForZoomLog10:logValue];
 
     // Notify delegate
     id<MBZoomSliderOverlayDelegate> delegate = _delegate;
-    if (delegate && [delegate respondsToSelector:@selector(zoomSliderOverlay:didChangeZoomLevel:)]) {
-        [delegate zoomSliderOverlay:self didChangeZoomLevel:zoomLevel];
+    if (delegate && [delegate respondsToSelector:@selector(zoomSliderOverlay:didChangeZoomLog10:)]) {
+        [delegate zoomSliderOverlay:self didChangeZoomLog10:logValue];
     }
 
     // Reset hide timer
@@ -234,28 +234,33 @@
 // Public Methods
 // =============================================================================
 
-- (void)updateZoomLevel:(double)zoomLevel {
-    // Convert zoom to log slider position
-    double logValue = 0.0;
-    if (zoomLevel > 1.0) {
-        logValue = log10(zoomLevel);
-        if (logValue > MB_ZOOM_LOG_MAX) logValue = MB_ZOOM_LOG_MAX;
-    }
+- (void)updateZoomLog10:(double)zoomLog10 {
+    double logValue = zoomLog10;
+    if (logValue < MB_ZOOM_LOG_MIN) logValue = MB_ZOOM_LOG_MIN;
+    if (logValue > MB_ZOOM_LOG_MAX) logValue = MB_ZOOM_LOG_MAX;
+
+    // Grow the slider range with the current depth instead of always
+    // spanning the full 0..4000: a fixed full-range track would move ~25
+    // decades per pixel, making the knob useless. With a range of ~1.5x the
+    // current depth (min 60 decades), one pixel is well under a decade at
+    // typical depths.
+    double range = logValue * 1.5 + 30.0;
+    if (range < 60.0) range = 60.0;
+    if (range > MB_ZOOM_LOG_MAX) range = MB_ZOOM_LOG_MAX;
+    [_slider setMaxValue:range];
 
     [_slider setDoubleValue:logValue];
-    [self updateLabelForZoom:zoomLevel];
+    [self updateLabelForZoomLog10:logValue];
 }
 
-- (void)updateLabelForZoom:(double)zoomLevel {
+- (void)updateLabelForZoomLog10:(double)zoomLog10 {
     NSString *label;
-    if (zoomLevel >= 1e15) {
-        label = [NSString stringWithFormat:@"%.0ex", zoomLevel];
-    } else if (zoomLevel >= 1e6) {
-        label = [NSString stringWithFormat:@"%.1ex", zoomLevel];
-    } else if (zoomLevel >= 1000) {
-        label = [NSString stringWithFormat:@"%.0fx", zoomLevel];
+    if (zoomLog10 >= 6.0) {
+        label = [NSString stringWithFormat:@"1e%.0fx", zoomLog10];
+    } else if (zoomLog10 >= 3.0) {
+        label = [NSString stringWithFormat:@"%.0fx", pow(10.0, zoomLog10)];
     } else {
-        label = [NSString stringWithFormat:@"%.1fx", zoomLevel];
+        label = [NSString stringWithFormat:@"%.1fx", pow(10.0, zoomLog10)];
     }
     [_zoomLabel setStringValue:label];
 }

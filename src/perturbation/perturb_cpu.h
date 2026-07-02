@@ -60,4 +60,45 @@ void perturb_cpu_tile(const double *ref_re, const double *ref_im,
                       uint32_t max_iter,
                       uint32_t *iterations, float *final_z2);
 
+// =============================================================================
+// Extended-exponent variant (zoom beyond ~1e290)
+// =============================================================================
+
+#include "../precision/floatexp.h"
+#include "bla.h"
+
+/**
+ * Iterate a single pixel whose delta does not fit a double. Runs a floatexp
+ * phase while |dz| is below double range and switches to the plain double
+ * loop once it grows (returning to floatexp if a rebase shrinks it again).
+ * Semantics otherwise identical to perturb_cpu_pixel.
+ */
+uint32_t perturb_cpu_pixel_fx(const double *ref_re, const double *ref_im,
+                              uint32_t ref_len,
+                              FloatExp dcx, FloatExp dcy,
+                              uint32_t max_iter, float *final_z2);
+
+// =============================================================================
+// BLA-accelerated variants (identical results, skips iteration runs)
+// =============================================================================
+
+/**
+ * Like perturb_cpu_pixel / perturb_cpu_pixel_fx, but consults a bilinear
+ * approximation table (see bla.h) to skip runs of iterations whose combined
+ * effect is a precomputed linear map. Pass bla == NULL to disable skipping.
+ * The table must have been built for this orbit with a dc_max covering
+ * |dcx|, |dcy|.
+ */
+uint32_t perturb_cpu_pixel_bla(const double *ref_re, const double *ref_im,
+                               uint32_t ref_len,
+                               double dcx, double dcy,
+                               uint32_t max_iter,
+                               const MBBlaTable *bla, float *final_z2);
+
+uint32_t perturb_cpu_pixel_fx_bla(const double *ref_re, const double *ref_im,
+                                  uint32_t ref_len,
+                                  FloatExp dcx, FloatExp dcy,
+                                  uint32_t max_iter,
+                                  const MBBlaTable *bla, float *final_z2);
+
 #endif // MB_PERTURB_CPU_H

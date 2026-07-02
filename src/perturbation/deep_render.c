@@ -1,7 +1,9 @@
 #include "deep_render.h"
 #include "perturbation.h"
 #include "perturb_cpu.h"
+#include "bla.h"
 #include "../precision/mp_real.h"
+#include "../precision/floatexp.h"
 #include "../color/color.h"
 
 #include <pthread.h>
@@ -10,11 +12,16 @@
 #include <string.h>
 #include <math.h>
 
-// How far (in complex units, as a multiple of the pixel scale) the reference
-// point may drift from the view center before the orbit is rebuilt. Deltas
-// are doubles; at 1e12 pixels of drift their relative rounding (~1e-16)
-// still leaves the per-pixel error under 1e-4 of a pixel.
-#define MB_DEEP_MAX_REF_DRIFT_PX 1e12
+// How far (in pixels) the reference point may drift from the view center
+// before the orbit is rebuilt. Kept small: the BLA validity radii are baked
+// with a |dc| bound that covers viewport + this drift, and a loose bound
+// would collapse the radii (no skipping). Rebuilding the orbit after a long
+// pan is far cheaper than losing BLA on every tile.
+#define MB_DEEP_MAX_REF_DRIFT_PX 4096.0
+
+// Above this zoom (log10), per-pixel deltas leave double range and the
+// extended-exponent pixel loop is used.
+#define MB_DEEP_FX_LOG10 280.0
 
 // =============================================================================
 // Refcounted orbit snapshot
@@ -22,6 +29,8 @@
 
 typedef struct {
     ReferenceOrbitHP orbit;      // owns the double arrays + ref strings
+    MBBlaTable bla;              // iteration-skipping table for this orbit
+    FloatExp bla_dc_max;         // |dc| bound the BLA radii were built with
     uint32_t computed_max_iter;  // iteration budget the orbit was built with
     _Atomic int refs;
 } DeepOrbit;
@@ -29,6 +38,7 @@ typedef struct {
 static void deep_orbit_release(DeepOrbit *o) {
     if (!o) return;
     if (atomic_fetch_sub(&o->refs, 1) == 1) {
+        mb_bla_free(&o->bla);
         ref_orbit_hp_cleanup(&o->orbit);
         free(o);
     }
@@ -39,7 +49,7 @@ struct MBDeepRenderer {
     DeepOrbit *cur;          // current orbit snapshot (may be NULL)
     uint64_t latest_gen;     // newest generation seen (guarded by lock)
     // Offset (view center - reference point) for latest_gen, in complex units.
-    double gen_ref_dx, gen_ref_dy;
+    FloatExp gen_ref_dx, gen_ref_dy;
     // Newest generation announced by the UI; read lock-free by tile loops so
     // stale tiles can abort mid-render.
     _Atomic uint64_t announced_gen;
@@ -67,47 +77,99 @@ void mb_deep_renderer_note_generation(MBDeepRenderer *r, uint64_t generation) {
     atomic_store(&r->announced_gen, generation);
 }
 
-// Compute (view center - orbit reference) in HP; returns the offsets as
-// doubles. Small results are exact; large results only need enough relative
-// precision to keep sub-pixel accuracy (checked against the drift limit).
+// Compute (view center - orbit reference) in HP; returned as FloatExp so it
+// stays exact at any zoom depth.
 static void compute_ref_offset(const MBViewState *view, const DeepOrbit *orbit,
-                               double *out_dx, double *out_dy) {
-    mpfr_prec_t prec = mp_required_precision(view->zoom_level) + 64;
+                               FloatExp *out_dx, FloatExp *out_dy) {
+    mpfr_prec_t prec = mp_required_precision_log10(mb_view_zoom_log10(view)) + 64;
 
     MPReal a, b, d;
     mp_real_init_set_str(&a, view->center_x_str, prec);
     mp_real_init_set_str(&b, orbit->orbit.ref_cx_str, prec);
     mp_real_init(&d, prec);
     mp_real_sub(&d, &a, &b);
-    *out_dx = mp_real_get_d(&d);
+    mp_real_get_fx(&d, &out_dx->m, &out_dx->e);
 
     mp_real_set_str(&a, view->center_y_str);
     mp_real_set_str(&b, orbit->orbit.ref_cy_str);
     mp_real_sub(&d, &a, &b);
-    *out_dy = mp_real_get_d(&d);
+    mp_real_get_fx(&d, &out_dy->m, &out_dy->e);
 
     mp_real_clear(&a);
     mp_real_clear(&b);
     mp_real_clear(&d);
 }
 
-// Build a new orbit at the view center. Returns NULL on failure.
-static DeepOrbit *build_orbit(const MBViewState *view, uint32_t max_iter) {
+// Abort polling for orbit builds: a deep orbit takes seconds; the moment the
+// UI announces a newer generation the build must stop (it holds the renderer
+// mutex, blocking every tile worker).
+typedef struct {
+    MBDeepRenderer *r;
+    uint64_t gen;
+} OrbitAbortCtx;
+
+static bool orbit_should_abort(void *p) {
+    OrbitAbortCtx *a = (OrbitAbortCtx *)p;
+    return atomic_load(&a->r->announced_gen) > a->gen;
+}
+
+// Build a new orbit at the view center. Returns NULL on failure or abort.
+// Called with r->lock held; `old` (r->cur) may serve as a continuation
+// source when the center is identical and only the budget grew.
+static DeepOrbit *build_orbit(MBDeepRenderer *r, uint64_t generation,
+                              const MBViewState *view, uint32_t max_iter) {
     DeepOrbit *o = calloc(1, sizeof(DeepOrbit));
     if (!o) return NULL;
 
-    mpfr_prec_t prec = mp_required_precision(view->zoom_level);
+    mpfr_prec_t prec = mp_required_precision_log10(mb_view_zoom_log10(view));
     if (ref_orbit_hp_init(&o->orbit, max_iter, (uint32_t)prec) != 0) {
         free(o);
         return NULL;
     }
 
-    ref_orbit_hp_compute(&o->orbit, view->center_x_str, view->center_y_str);
+    OrbitAbortCtx abort_ctx = {r, generation};
+
+    // Zooming in on the same center only grows the iteration budget: resume
+    // the previous orbit from its saved final state instead of recomputing
+    // hundreds of thousands of MPFR iterations from zero. "Same center" is
+    // decided by value (the strings gain digits as the zoom deepens).
+    bool continued = false;
+    DeepOrbit *old = r->cur;
+    if (old && old->orbit.valid && old->orbit.cont_z &&
+        old->orbit.precision == (uint32_t)prec &&
+        old->orbit.max_iter < max_iter) {
+        FloatExp dx, dy;
+        compute_ref_offset(view, old, &dx, &dy);
+        if (fx_is_zero(dx) && fx_is_zero(dy)) {
+            continued = ref_orbit_hp_continue(&o->orbit, &old->orbit,
+                                              orbit_should_abort, &abort_ctx) == 0;
+        }
+    }
+
+    if (!continued) {
+        ref_orbit_hp_compute_cancellable(&o->orbit,
+                                         view->center_x_str, view->center_y_str,
+                                         orbit_should_abort, &abort_ctx);
+    }
     if (!o->orbit.valid || o->orbit.escape_iter < 1) {
         ref_orbit_hp_cleanup(&o->orbit);
         free(o);
         return NULL;
     }
+
+    // BLA table for iteration skipping. dc_max covers every pixel this orbit
+    // can serve: the viewport diagonal plus the allowed reference drift.
+    uint32_t ref_len = o->orbit.escape_iter + 1;
+    if (ref_len > o->orbit.max_iter) ref_len = o->orbit.max_iter;
+    double reach_px = hypot(view->viewport_width, view->viewport_height)
+                      + MB_DEEP_MAX_REF_DRIFT_PX;
+    FloatExp dc_max = fx_mul_d(mb_view_get_scale_fx(view), reach_px);
+    if (mb_bla_build(&o->bla, o->orbit.z_real, o->orbit.z_imag,
+                     ref_len, dc_max) != 0) {
+        // Table allocation failed: render without skipping (correct, slower)
+        mb_bla_free(&o->bla);
+    }
+    o->bla_dc_max = dc_max;
 
     o->computed_max_iter = max_iter;
     atomic_store(&o->refs, 1);
@@ -120,10 +182,26 @@ int mb_deep_renderer_render_tile(MBDeepRenderer *r,
                                  uint32_t max_iter,
                                  const MBRenderSettings *settings,
                                  PixelColor *out) {
-    if (!r || !view || !out || tile_size <= 0) return MB_DEEP_ERROR;
+    return mb_deep_renderer_render_tile_strided(r, view, generation,
+                                                tile_px, tile_py, tile_size,
+                                                1, max_iter, settings, out);
+}
 
-    double scale = mb_view_get_scale(view);
-    if (!(scale > 0.0) || !isfinite(scale)) return MB_DEEP_ERROR;
+// Shared core; exactly one of out_colors / out_iters is non-NULL.
+static int render_tile_impl(MBDeepRenderer *r,
+                            const MBViewState *view, uint64_t generation,
+                            int tile_px, int tile_py, int tile_size,
+                            int stride,
+                            uint32_t max_iter,
+                            const MBRenderSettings *settings,
+                            PixelColor *out_colors, uint32_t *out_iters) {
+    if (!r || !view || (!out_colors && !out_iters) || tile_size <= 0) return MB_DEEP_ERROR;
+    if (stride <= 0 || tile_size % stride != 0) return MB_DEEP_ERROR;
+    if (view->viewport_width <= 0 || view->viewport_height <= 0) return MB_DEEP_ERROR;
+
+    double zoom_l10 = mb_view_zoom_log10(view);
+    FloatExp scale = mb_view_get_scale_fx(view);
+    if (fx_is_zero(scale)) return MB_DEEP_ERROR;
 
     // --- Acquire an orbit snapshot consistent with this generation ---
     pthread_mutex_lock(&r->lock);
@@ -140,26 +218,37 @@ int mb_deep_renderer_render_tile(MBDeepRenderer *r,
     if (generation > r->latest_gen || !r->cur) {
         // New view state: decide whether the existing orbit is reusable.
         bool rebuild = true;
-        double dx = 0.0, dy = 0.0;
+        FloatExp dx = fx_zero(), dy = fx_zero();
 
         if (r->cur && r->cur->computed_max_iter >= max_iter) {
-            compute_ref_offset(view, r->cur, &dx, &dy);
-            double drift_limit = MB_DEEP_MAX_REF_DRIFT_PX * scale;
-            if (fabs(dx) < drift_limit && fabs(dy) < drift_limit) {
-                rebuild = false;
+            // The BLA radii were built assuming |dc| <= bla_dc_max. Zooming
+            // OUT grows per-pixel |dc| beyond that bound and would let
+            // merged entries skip outside their validity budget, so reuse is
+            // only sound when the current reach still fits.
+            double reach_px = hypot(view->viewport_width, view->viewport_height)
+                              + MB_DEEP_MAX_REF_DRIFT_PX;
+            FloatExp needed_dc_max = fx_mul_d(scale, reach_px);
+            if (fx_cmp_abs(needed_dc_max, r->cur->bla_dc_max) <= 0) {
+                compute_ref_offset(view, r->cur, &dx, &dy);
+                FloatExp drift_limit = fx_mul_d(scale, MB_DEEP_MAX_REF_DRIFT_PX);
+                if (fx_cmp_abs(dx, drift_limit) < 0 && fx_cmp_abs(dy, drift_limit) < 0) {
+                    rebuild = false;
+                }
             }
         }
 
         if (rebuild) {
-            DeepOrbit *fresh = build_orbit(view, max_iter);
+            DeepOrbit *fresh = build_orbit(r, generation, view, max_iter);
             if (!fresh) {
                 pthread_mutex_unlock(&r->lock);
-                return MB_DEEP_ERROR;
+                // Distinguish "the view moved on mid-build" from real failure
+                return atomic_load(&r->announced_gen) > generation
+                           ? MB_DEEP_STALE : MB_DEEP_ERROR;
             }
             deep_orbit_release(r->cur);
             r->cur = fresh;
-            dx = 0.0;
-            dy = 0.0;
+            dx = fx_zero();
+            dy = fx_zero();
         }
 
         r->latest_gen = generation;
@@ -169,8 +258,8 @@ int mb_deep_renderer_render_tile(MBDeepRenderer *r,
 
     DeepOrbit *orbit = r->cur;
     atomic_fetch_add(&orbit->refs, 1);
-    double ref_dx = r->gen_ref_dx;
-    double ref_dy = r->gen_ref_dy;
+    FloatExp ref_dx = r->gen_ref_dx;
+    FloatExp ref_dy = r->gen_ref_dy;
 
     pthread_mutex_unlock(&r->lock);
 
@@ -184,8 +273,11 @@ int mb_deep_renderer_render_tile(MBDeepRenderer *r,
 
     double half_w = view->viewport_width / 2.0;
     double half_h = view->viewport_height / 2.0;
+    bool use_fx = zoom_l10 > MB_DEEP_FX_LOG10;
+    int out_dim = tile_size / stride;
+    double sample_off = (stride - 1) / 2.0;  // sample block centers
 
-    for (int ly = 0; ly < tile_size; ly++) {
+    for (int ly = 0; ly < out_dim; ly++) {
         // Abort mid-tile if the UI announced a newer generation: at extreme
         // zoom a tile can take seconds, and the user has already moved on.
         if (atomic_load(&r->announced_gen) > generation) {
@@ -193,22 +285,56 @@ int mb_deep_renderer_render_tile(MBDeepRenderer *r,
             return MB_DEEP_STALE;
         }
 
-        int py = tile_py + ly;
+        double py = tile_py + ly * stride + sample_off;
         // Screen py grows downward, imaginary axis grows upward.
-        double dcy = ref_dy + (half_h - py) * scale;
+        FloatExp dcy = fx_add(ref_dy, fx_mul_d(scale, half_h - py));
+        double dcy_d = fx_to_d(dcy);
 
-        for (int lx = 0; lx < tile_size; lx++) {
-            int px = tile_px + lx;
-            double dcx = ref_dx + (px - half_w) * scale;
+        for (int lx = 0; lx < out_dim; lx++) {
+            double px = tile_px + lx * stride + sample_off;
+            FloatExp dcx = fx_add(ref_dx, fx_mul_d(scale, px - half_w));
 
             float z2 = 0.0f;
-            uint32_t iter = perturb_cpu_pixel(ref_re, ref_im, ref_len,
-                                              dcx, dcy, max_iter, &z2);
-            color_from_iteration_ex(&out[(size_t)ly * (size_t)tile_size + (size_t)lx],
-                                    iter, z2, max_iter, settings);
+            uint32_t iter;
+            if (use_fx) {
+                iter = perturb_cpu_pixel_fx_bla(ref_re, ref_im, ref_len,
+                                                dcx, dcy, max_iter,
+                                                &orbit->bla, &z2);
+            } else {
+                iter = perturb_cpu_pixel_bla(ref_re, ref_im, ref_len,
+                                             fx_to_d(dcx), dcy_d, max_iter,
+                                             &orbit->bla, &z2);
+            }
+            size_t idx = (size_t)ly * (size_t)out_dim + (size_t)lx;
+            if (out_colors) {
+                color_from_iteration_ex(&out_colors[idx], iter, z2, max_iter, settings);
+            } else {
+                out_iters[idx] = iter;
+            }
         }
     }
 
     deep_orbit_release(orbit);
     return MB_DEEP_OK;
+}
+
+int mb_deep_renderer_render_tile_strided(MBDeepRenderer *r,
+                                         const MBViewState *view, uint64_t generation,
+                                         int tile_px, int tile_py, int tile_size,
+                                         int stride,
+                                         uint32_t max_iter,
+                                         const MBRenderSettings *settings,
+                                         PixelColor *out) {
+    return render_tile_impl(r, view, generation, tile_px, tile_py, tile_size,
+                            stride, max_iter, settings, out, NULL);
+}
+
+int mb_deep_renderer_probe_strided(MBDeepRenderer *r,
+                                   const MBViewState *view, uint64_t generation,
+                                   int tile_px, int tile_py, int tile_size,
+                                   int stride,
+                                   uint32_t max_iter,
+                                   uint32_t *iters_out) {
+    return render_tile_impl(r, view, generation, tile_px, tile_py, tile_size,
+                            stride, max_iter, NULL, NULL, iters_out);
 }

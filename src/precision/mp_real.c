@@ -110,3 +110,51 @@ mpfr_prec_t mp_required_precision(double zoom_level) {
     if (bits <= 2048) return 2048;
     return 4096;  // Max reasonable precision
 }
+
+mpfr_prec_t mp_required_precision_log10(double zoom_log10) {
+    if (zoom_log10 <= 0.0) {
+        return 64;
+    }
+
+    // bits = log2(10^zoom_log10) + margin, rounded up to a multiple of 256.
+    // (Power-of-two rounding wasted up to 2x precision — and MPFR multiply
+    // cost — right below each boundary; the 80-bit guard already spans far
+    // more zoom decades than one 256-bit quantum, so tier reuse is safe.)
+    double bits_needed = zoom_log10 * 3.321928094887362 + 80.0;
+    if (bits_needed <= 64.0) return 64;
+    if (bits_needed > (double)(1 << 20)) return (mpfr_prec_t)(1 << 20);
+
+    mpfr_prec_t bits = ((mpfr_prec_t)bits_needed + 255) & ~(mpfr_prec_t)255;
+    if (bits < 128) bits = 128;
+    return bits;
+}
+
+// =============================================================================
+// Extended-Exponent Bridges
+// =============================================================================
+
+void mp_real_add_fx(MPReal *r, const MPReal *a, double fx_m, int64_t fx_e) {
+    if (fx_m == 0.0) {
+        mpfr_set(r->value, a->value, MPFR_RNDN);
+        return;
+    }
+    MPReal t;
+    mp_real_init(&t, r->precision);
+    mpfr_set_d(t.value, fx_m, MPFR_RNDN);
+    mpfr_mul_2si(t.value, t.value, (long)fx_e, MPFR_RNDN);
+    mpfr_add(r->value, a->value, t.value, MPFR_RNDN);
+    mp_real_clear(&t);
+}
+
+void mp_real_get_fx(const MPReal *x, double *fx_m, int64_t *fx_e) {
+    if (mpfr_zero_p(x->value)) {
+        *fx_m = 0.0;
+        *fx_e = 0;
+        return;
+    }
+    long e = 0;
+    // Returns d in +-[0.5, 1) with value = d * 2^e
+    double d = mpfr_get_d_2exp(&e, x->value, MPFR_RNDN);
+    *fx_m = d;
+    *fx_e = (int64_t)e;
+}

@@ -12,7 +12,8 @@
 // strings in MBViewState (center_x_str / center_y_str) the source of truth,
 // updating them with MPFR at a precision that scales with the zoom level.
 // The double fields center_x / center_y are kept in sync as (lossy) display
-// approximations.
+// approximations. Beyond zoom ~1e300, offsets are passed as FloatExp because
+// they no longer fit a double at all.
 //
 // Every mutation of the view center in the app must go through these
 // functions; writing center_x/center_y directly and re-serializing with
@@ -20,9 +21,10 @@
 
 /**
  * Number of significant decimal digits needed to address a pixel at the
- * given zoom (plus guard digits).
+ * given zoom (plus guard digits). The log10 variant works at any depth.
  */
 int mb_view_hp_digits(double zoom_level);
+int mb_view_hp_digits_log10(double zoom_log10);
 
 /**
  * Normalize the state so strings and doubles agree. Call once after
@@ -32,32 +34,36 @@ void mb_view_hp_sync_from_doubles(MBViewState *view);
 
 /**
  * Set the center from decimal strings (e.g. user input). Doubles are synced.
- * Returns 0 on success, -1 if a string does not parse.
+ * All digits of the input are preserved even if the current zoom would need
+ * fewer. Returns 0 on success, -1 if a string does not parse.
  */
 int mb_view_hp_set_center(MBViewState *view, const char *re_str, const char *im_str);
 
 /**
  * Translate the center by small complex offsets (typically pixels * scale).
- * The offsets are doubles: they are *relative* moves, so double precision is
- * exact enough regardless of the absolute zoom depth.
+ * The FloatExp variant is exact at any zoom depth; the double variant is a
+ * convenience for shallow-zoom callers.
  */
+void mb_view_hp_translate_fx(MBViewState *view, FloatExp d_re, FloatExp d_im);
 void mb_view_hp_translate(MBViewState *view, double d_re, double d_im);
 
 /**
  * Zoom by `factor` keeping the complex point under the given viewport offset
  * fixed on screen. Offsets are in pixels relative to the viewport center,
  * with off_y_up positive toward the top of the screen (imaginary axis up).
- * The zoom level is clamped to [MB_ZOOM_MIN, MB_ZOOM_MAX].
+ * The zoom is updated in log space and clamped to
+ * [MB_ZOOM_LOG10_MIN, MB_ZOOM_LOG10_MAX].
  */
 void mb_view_hp_zoom_towards(MBViewState *view, double off_x_px, double off_y_up_px,
                              double factor);
 
 /**
- * Compute (to.center - from.center) in high precision and return it as
- * doubles. The difference between two nearby views is small, so a double
- * result keeps sub-pixel accuracy even when the absolute centers do not fit
- * a double. Used e.g. to reproject the previous frame as a placeholder.
+ * Compute (to.center - from.center) in high precision. The FloatExp variant
+ * is exact at any depth; the double variant saturates outside double range.
+ * Used e.g. to reproject the previous frame as a placeholder.
  */
+void mb_view_hp_center_delta_fx(const MBViewState *from, const MBViewState *to,
+                                FloatExp *d_re, FloatExp *d_im);
 void mb_view_hp_center_delta(const MBViewState *from, const MBViewState *to,
                              double *d_re, double *d_im);
 

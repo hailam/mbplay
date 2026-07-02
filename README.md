@@ -50,6 +50,9 @@ xmake f --tsan=y -m debug
 
 ```bash
 ./build/macosx/arm64/release/mandelbrot_interactive
+
+# Cinematic autopilot: dives into interesting boundary regions indefinitely
+./build/macosx/arm64/release/mandelbrot_interactive --cinematic --speed 0.5
 ```
 
 ### CLI Generator
@@ -73,6 +76,7 @@ xmake f --tsan=y -m debug
 | `R` | Reset to default view |
 | `1-9` | Jump to preset locations |
 | `P` | Show preset menu |
+| `V` | Cinematic autopilot zoom (V/Esc exits at the current location) |
 | `I` | Toggle HUD |
 | `M` | Toggle minimap |
 | `C` | Toggle coordinate display |

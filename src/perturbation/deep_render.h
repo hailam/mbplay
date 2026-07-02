@@ -69,4 +69,31 @@ int mb_deep_renderer_render_tile(MBDeepRenderer *r,
                                  const MBRenderSettings *settings,
                                  PixelColor *out);
 
+/**
+ * Strided variant for progressive refinement: computes every stride-th pixel
+ * (sampling block centers), writing a (tile_size/stride)^2 buffer. A coarse
+ * stride-4 pass costs 1/16th of the full tile and is upscaled as a preview
+ * while the full-resolution pass runs. stride must divide tile_size.
+ */
+int mb_deep_renderer_render_tile_strided(MBDeepRenderer *r,
+                                         const MBViewState *view, uint64_t generation,
+                                         int tile_px, int tile_py, int tile_size,
+                                         int stride,
+                                         uint32_t max_iter,
+                                         const MBRenderSettings *settings,
+                                         PixelColor *out);
+
+/**
+ * Probe variant: raw iteration counts instead of colors, for interest
+ * scoring (e.g. the cinematic autopilot steering toward the boundary).
+ * Writes a (tile_size/stride)^2 buffer of iteration counts; max_iter means
+ * "did not escape".
+ */
+int mb_deep_renderer_probe_strided(MBDeepRenderer *r,
+                                   const MBViewState *view, uint64_t generation,
+                                   int tile_px, int tile_py, int tile_size,
+                                   int stride,
+                                   uint32_t max_iter,
+                                   uint32_t *iters_out);
+
 #endif // MB_DEEP_RENDER_H
