@@ -46,8 +46,10 @@ uint32_t perturb_cpu_pixel_bla(const double *ref_re, const double *ref_im,
             dmag = zmag;
         }
 
-        // Try to skip a run of iterations with a bilinear approximation
-        if (bla && m != 0) {
+        // Try to skip a run of iterations with a bilinear approximation.
+        // The max_r2_d pre-filter keeps the (comparatively expensive) fx
+        // lookup off the hot path when no entry could apply anyway.
+        if (bla && m != 0 && dmag <= bla->max_r2_d) {
             const MBBlaEntry *e = mb_bla_lookup(bla, m, fx_from_d(dmag));
             if (e && (uint64_t)m + e->l < ref_len) {
                 FloatExpC dz = fxc_from_d(dx, dy);
@@ -157,7 +159,7 @@ uint32_t perturb_cpu_pixel_fx_bla(const double *ref_re, const double *ref_im,
             }
 
             // BLA skip (floatexp application)
-            if (bla && m != 0) {
+            if (bla && m != 0 && fx_cmp_abs(dmag, bla->max_r2) <= 0) {
                 const MBBlaEntry *e = mb_bla_lookup(bla, m, dmag);
                 if (e && (uint64_t)m + e->l < ref_len) {
                     FloatExpC A = {e->a_re, e->a_im};
@@ -228,7 +230,7 @@ uint32_t perturb_cpu_pixel_fx_bla(const double *ref_re, const double *ref_im,
                 }
             }
 
-            if (bla && m != 0) {
+            if (bla && m != 0 && dmag <= bla->max_r2_d) {
                 const MBBlaEntry *e = mb_bla_lookup(bla, m, fx_from_d(dmag));
                 if (e && (uint64_t)m + e->l < ref_len) {
                     FloatExpC dzf = fxc_from_d(dx, dy);

@@ -2,6 +2,7 @@
 #include "perturbation.h"
 #include "perturb_cpu.h"
 #include "bla.h"
+#include "../gpu/gpu.h"
 #include "../precision/mp_real.h"
 #include "../precision/floatexp.h"
 #include "../color/color.h"
@@ -22,6 +23,16 @@
 // Above this zoom (log10), per-pixel deltas leave double range and the
 // extended-exponent pixel loop is used.
 #define MB_DEEP_FX_LOG10 280.0
+
+// Up to this zoom (log10), per-pixel deltas still fit FLOAT exponent range
+// (|dc| >= ~1e-32) and tiles can run on the GPU in float-float arithmetic.
+#define MB_DEEP_GPU_LOG10 28.0
+
+static _Atomic bool g_gpu_enabled = true;
+
+void mb_deep_render_set_gpu_enabled(bool enabled) {
+    atomic_store(&g_gpu_enabled, enabled);
+}
 
 // =============================================================================
 // Refcounted orbit snapshot
@@ -276,6 +287,40 @@ static int render_tile_impl(MBDeepRenderer *r,
     bool use_fx = zoom_l10 > MB_DEEP_FX_LOG10;
     int out_dim = tile_size / stride;
     double sample_off = (stride - 1) / 2.0;  // sample block centers
+
+    // GPU float-float fast path: full-resolution tiles inside the float
+    // exponent window. Falls through to the CPU loops on any refusal.
+    if (stride == 1 && zoom_l10 <= MB_DEEP_GPU_LOG10 &&
+        atomic_load(&g_gpu_enabled) && gpu_df_available()) {
+        size_t pixels = (size_t)tile_size * tile_size;
+        uint32_t *iters = malloc(pixels * sizeof(uint32_t));
+        float *z2s = malloc(pixels * sizeof(float));
+        if (iters && z2s) {
+            double dc0x = fx_to_d(fx_add(ref_dx, fx_mul_d(scale, tile_px - half_w)));
+            double dc0y = fx_to_d(fx_add(ref_dy, fx_mul_d(scale, half_h - tile_py)));
+            double step = fx_to_d(scale);
+
+            if (gpu_perturb_df_tile(ref_re, ref_im, ref_len,
+                                    dc0x, dc0y, step, -step,
+                                    (uint32_t)tile_size, max_iter,
+                                    iters, z2s) == 0) {
+                for (size_t i = 0; i < pixels; i++) {
+                    if (out_colors) {
+                        color_from_iteration_ex(&out_colors[i], iters[i], z2s[i],
+                                                max_iter, settings);
+                    } else {
+                        out_iters[i] = iters[i];
+                    }
+                }
+                free(iters);
+                free(z2s);
+                deep_orbit_release(orbit);
+                return MB_DEEP_OK;
+            }
+        }
+        free(iters);
+        free(z2s);
+    }
 
     for (int ly = 0; ly < out_dim; ly++) {
         // Abort mid-tile if the UI announced a newer generation: at extreme

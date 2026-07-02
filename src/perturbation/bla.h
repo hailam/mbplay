@@ -48,6 +48,13 @@ typedef struct {
     uint32_t *level_cnt;   // entry count per level
     int levels;            // number of levels (level k skips 2^(k+1) steps)
     uint32_t orbit_len;
+    // Pre-filters: the largest r2 in the table. A lookup can only succeed
+    // when |dz|^2 is below this, so the hot loops test one double compare
+    // (or one fx compare) before paying for the level walk — without this,
+    // the lookup overhead outweighs the skipped iterations on
+    // boundary-escaping pixels where radii rarely apply.
+    double max_r2_d;       // saturating double form (DBL_MAX if huge)
+    FloatExp max_r2;
 } MBBlaTable;
 
 /**

@@ -107,6 +107,8 @@ int mb_bla_build(MBBlaTable *t, const double *ref_re, const double *ref_im,
         prev[i] = merge(a, b, dc_max);
     }
 
+    FloatExp max_r2 = fx_zero();
+
     for (int k = 0; k < levels; k++) {
         t->level_off[k] = off;
         t->level_cnt[k] = cnt;
@@ -118,6 +120,9 @@ int mb_bla_build(MBBlaTable *t, const double *ref_re, const double *ref_im,
             e->b_im = prev[i].b.im;
             e->r2 = fx_mul(prev[i].r, prev[i].r);
             e->l = prev[i].r.m > 0.0 ? prev[i].l : 0;
+            if (e->l != 0 && fx_cmp_abs(e->r2, max_r2) > 0) {
+                max_r2 = e->r2;
+            }
         }
         off += cnt;
 
@@ -131,6 +136,9 @@ int mb_bla_build(MBBlaTable *t, const double *ref_re, const double *ref_im,
         curw = tmp;
         cnt = next;
     }
+
+    t->max_r2 = max_r2;
+    t->max_r2_d = max_r2.e > 1023 ? 1.7976931348623157e308 : fx_to_d(max_r2);
 
     free(prev);
     free(curw);

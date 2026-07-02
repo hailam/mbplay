@@ -135,6 +135,7 @@ bool gpu_perturbation_initialized(void) {
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <pthread.h>
 
 // =============================================================================
 // Metal Shader Source (generated from mandelbrot.metal)
@@ -195,6 +196,36 @@ static bool smoothInitialized = false;
 static MtComputePipelineState *pipelineTileSS4 = NULL;
 static MtBuffer *smoothIterBuffer = NULL;
 static bool supersampleInitialized = false;
+
+// Float-float perturbation state. Access serialized by dfLock: the shared
+// buffers + waitUntilCompleted pattern is single-flight, but tile workers
+// call from concurrent queues.
+#define MB_DF_REF_CAP 16384
+static MtComputePipelineState *pipelineDf = NULL;
+static MtBuffer *dfParamsBuffer = NULL;
+static MtBuffer *dfRefBuffer = NULL;      // float4 per orbit entry
+static MtBuffer *dfIterBuffer = NULL;
+static MtBuffer *dfZ2Buffer = NULL;
+static bool dfInitialized = false;
+static pthread_mutex_t dfLock = PTHREAD_MUTEX_INITIALIZER;
+static const double *dfLastRef = NULL;    // orbit identity for upload caching
+static uint32_t dfLastLen = 0;
+
+// Must match the Metal DfPerturbParams layout (all 4-byte fields)
+typedef struct {
+    uint32_t tile_size;
+    uint32_t max_iter;
+    uint32_t ref_len;
+    float dcx0_hi, dcx0_lo;
+    float dcy0_hi, dcy0_lo;
+    float stepx_hi, stepx_lo;
+    float stepy_hi, stepy_lo;
+} DfPerturbParams;
+
+static inline void df_split(double v, float *hi, float *lo) {
+    *hi = (float)v;
+    *lo = (float)(v - (double)*hi);
+}
 
 // TileParams struct for GPU (must match Metal shader)
 typedef struct {
@@ -380,6 +411,31 @@ void gpu_cleanup(void) {
         pipelineTileSS4 = NULL;
     }
     supersampleInitialized = false;
+
+    // Float-float perturbation resources
+    dfInitialized = false;
+    dfLastRef = NULL;
+    dfLastLen = 0;
+    if (dfZ2Buffer) {
+        mtRelease(dfZ2Buffer);
+        dfZ2Buffer = NULL;
+    }
+    if (dfIterBuffer) {
+        mtRelease(dfIterBuffer);
+        dfIterBuffer = NULL;
+    }
+    if (dfRefBuffer) {
+        mtRelease(dfRefBuffer);
+        dfRefBuffer = NULL;
+    }
+    if (dfParamsBuffer) {
+        mtRelease(dfParamsBuffer);
+        dfParamsBuffer = NULL;
+    }
+    if (pipelineDf) {
+        mtRelease(pipelineDf);
+        pipelineDf = NULL;
+    }
 
     // Smooth coloring buffers
     if (finalZ2Buffer) {
@@ -613,10 +669,90 @@ int gpu_init_perturbation(uint32_t max_iter) {
         smoothIterBuffer = mtDeviceNewBufferWithLength(device, smoothIterSize, MtResourceStorageModeShared);
 
         supersampleInitialized = (pipelineTileSS4 != NULL && smoothIterBuffer != NULL);
+
+        // Float-float perturbation pipeline
+        MtFunction *kernelDf = mtNewFunctionWithName(library, "mandelbrot_perturb_df");
+        if (kernelDf) {
+            pipelineDf = mtNewComputePipelineStateWithFunction(device, kernelDf, NULL);
+            mtRelease(kernelDf);
+        }
+        dfParamsBuffer = mtDeviceNewBufferWithLength(device, sizeof(DfPerturbParams), MtResourceStorageModeShared);
+        dfRefBuffer = mtDeviceNewBufferWithLength(device, (size_t)MB_DF_REF_CAP * 4 * sizeof(float), MtResourceStorageModeShared);
+        size_t dfPixels = (size_t)MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE;
+        dfIterBuffer = mtDeviceNewBufferWithLength(device, dfPixels * sizeof(uint32_t), MtResourceStorageModeShared);
+        dfZ2Buffer = mtDeviceNewBufferWithLength(device, dfPixels * sizeof(float), MtResourceStorageModeShared);
+        dfLastRef = NULL;
+        dfLastLen = 0;
+        dfInitialized = (pipelineDf && dfParamsBuffer && dfRefBuffer &&
+                         dfIterBuffer && dfZ2Buffer);
     }
 
     perturbMaxIter = max_iter;
     perturbInitialized = true;
+
+    return 0;
+}
+
+bool gpu_df_available(void) {
+    return dfInitialized;
+}
+
+int gpu_perturb_df_tile(const double *ref_re, const double *ref_im, uint32_t ref_len,
+                        double dc0x, double dc0y, double step_x, double step_y,
+                        uint32_t tile_size, uint32_t max_iter,
+                        uint32_t *iterations, float *final_z2) {
+    if (!dfInitialized || !ref_re || !ref_im || !iterations || !final_z2) return -1;
+    if (ref_len < 1 || ref_len > MB_DF_REF_CAP) return -1;
+    if (tile_size < 1 || tile_size > MB_INTERACTIVE_TILE_SIZE) return -1;
+    if (max_iter > 65536) return -1;   // GPU watchdog headroom
+
+    pthread_mutex_lock(&dfLock);
+
+    // Upload the orbit only when it changed (pointer identity: orbit arrays
+    // are immutable and outlive the call via the deep renderer's refcount)
+    if (ref_re != dfLastRef || ref_len != dfLastLen) {
+        float *dst = mtBufferContents(dfRefBuffer);
+        for (uint32_t i = 0; i < ref_len; i++) {
+            df_split(ref_re[i], &dst[i * 4 + 0], &dst[i * 4 + 1]);
+            df_split(ref_im[i], &dst[i * 4 + 2], &dst[i * 4 + 3]);
+        }
+        dfLastRef = ref_re;
+        dfLastLen = ref_len;
+    }
+
+    DfPerturbParams *params = mtBufferContents(dfParamsBuffer);
+    params->tile_size = tile_size;
+    params->max_iter = max_iter;
+    params->ref_len = ref_len;
+    df_split(dc0x, &params->dcx0_hi, &params->dcx0_lo);
+    df_split(dc0y, &params->dcy0_hi, &params->dcy0_lo);
+    df_split(step_x, &params->stepx_hi, &params->stepx_lo);
+    df_split(step_y, &params->stepy_hi, &params->stepy_lo);
+
+    MtCommandBuffer *cmdBuffer = mtNewCommandBuffer(commandQueue);
+    mtRetain(cmdBuffer);
+    MtComputeCommandEncoder *encoder = mtNewComputeCommandEncoder(cmdBuffer);
+
+    mtComputeCommandEncoderSetComputePipelineState(encoder, pipelineDf);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, dfIterBuffer, 0, 0);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, dfZ2Buffer, 0, 1);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, dfParamsBuffer, 0, 2);
+    mtComputeCommandEncoderSetBufferOffsetAtIndex(encoder, dfRefBuffer, 0, 3);
+
+    MtSize gridSize = {(NsUInteger)tile_size, (NsUInteger)tile_size, 1};
+    MtSize threadgroupSize = {16, 16, 1};
+    mtComputeCommandEncoderDispatchThread_threadsPerThreadgroup(encoder, gridSize, threadgroupSize);
+
+    mtComputeCommandEncoderEndEncoding(encoder);
+    mtCommandBufferCommit(cmdBuffer);
+    mtCommandBufferWaitUntilCompleted(cmdBuffer);
+
+    size_t pixels = (size_t)tile_size * tile_size;
+    memcpy(iterations, mtBufferContents(dfIterBuffer), pixels * sizeof(uint32_t));
+    memcpy(final_z2, mtBufferContents(dfZ2Buffer), pixels * sizeof(float));
+
+    mtRelease(cmdBuffer);
+    pthread_mutex_unlock(&dfLock);
 
     return 0;
 }
@@ -1006,6 +1142,21 @@ void gpu_compute_tile_smooth(const GPUTileParams *params,
     (void)params;
     (void)output;
     (void)settings;
+}
+
+bool gpu_df_available(void) {
+    return false;
+}
+
+int gpu_perturb_df_tile(const double *ref_re, const double *ref_im, uint32_t ref_len,
+                        double dc0x, double dc0y, double step_x, double step_y,
+                        uint32_t tile_size, uint32_t max_iter,
+                        uint32_t *iterations, float *final_z2) {
+    (void)ref_re; (void)ref_im; (void)ref_len;
+    (void)dc0x; (void)dc0y; (void)step_x; (void)step_y;
+    (void)tile_size; (void)max_iter;
+    (void)iterations; (void)final_z2;
+    return -1;
 }
 
 void gpu_compute_tile_supersampled(const GPUTileParams *params,

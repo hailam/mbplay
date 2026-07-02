@@ -450,7 +450,9 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         _cinematicMode = false;
         _cineDirector = NULL;
         _cineQueue = dispatch_queue_create("com.mandelbrot.cinematic", DISPATCH_QUEUE_SERIAL);
-        _cineSpeed = 0.5;   // decades per second
+        // Slow-motion default: reads like screen-recording B-roll, and the
+        // prefetch pipeline stays far ahead at this pace.
+        _cineSpeed = 0.3;   // decades per second
         _cineRestartPreset = 0;
 
         // Load render settings from user defaults or use defaults
@@ -1570,6 +1572,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 // =============================================================================
 
 - (void)magnifyWithEvent:(NSEvent *)event {
+    if (atomic_load(&_cinematicMode)) return;   // autopilot owns the camera
     // Pinch-to-zoom
     double zoom = 1.0 + event.magnification;
     NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
@@ -1581,6 +1584,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 }
 
 - (void)scrollWheel:(NSEvent *)event {
+    if (atomic_load(&_cinematicMode)) return;   // autopilot owns the camera
     if (event.modifierFlags & NSEventModifierFlagCommand) {
         // Command+scroll = zoom
         double delta = 1.0 + event.scrollingDeltaY * MB_SCROLL_SENSITIVITY;
@@ -1608,6 +1612,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 }
 
 - (void)mouseDragged:(NSEvent *)event {
+    if (atomic_load(&_cinematicMode)) return;   // autopilot owns the camera
     // No panning at 1x zoom - nothing useful outside default bounds
     if (_viewState.zoom_level <= 1.0) return;
 
@@ -2743,28 +2748,53 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     });
 }
 
-// Nearest-neighbor draw of a keyframe under the playback transform:
-// src_x = w/2 + offX + (dst_x - w/2) * ratio (same height mapping). When
-// `clear` is set, out-of-range destination pixels are blacked (base layer);
-// otherwise they are left untouched (sharp inset layer).
+// Bilinear draw of a keyframe under the playback transform:
+// src_x = w/2 + offX + (dst_x - w/2) * ratio (same height mapping).
+// Bilinear matters for cinematic motion: nearest sampling quantizes the
+// continuous zoom into per-pixel jumps that read as crawling/shimmer.
+// When `clear` is set, out-of-range destination pixels are blacked (base
+// layer); otherwise they are left untouched (sharp inset layer).
 - (void)blitCineFrame:(const PixelColor *)src ratio:(double)ratio
                  offX:(double)offX offY:(double)offY clear:(BOOL)clear {
     int w = _viewState.viewport_width;
     int h = _viewState.viewport_height;
-    double baseX = w / 2.0 + offX - (w / 2.0) * ratio;
-    double baseY = h / 2.0 + offY - (h / 2.0) * ratio;
+    double baseX = w / 2.0 + offX - (w / 2.0) * ratio - 0.5;
+    double baseY = h / 2.0 + offY - (h / 2.0) * ratio - 0.5;
 
     for (int dy = 0; dy < h; dy++) {
         double sy = baseY + dy * ratio;
-        BOOL rowValid = (sy >= 0.0 && sy < (double)h);
-        int syi = rowValid ? (int)sy : 0;
+        BOOL rowValid = (sy >= 0.0 && sy <= (double)(h - 1));
+        int sy0 = 0, sy1 = 0;
+        double fy = 0.0;
+        if (rowValid) {
+            sy0 = (int)sy;
+            sy1 = sy0 + 1 < h ? sy0 + 1 : sy0;
+            fy = sy - sy0;
+        }
         PixelColor *dst = &_framebuffer[(size_t)dy * w];
-        const PixelColor *srow = &src[(size_t)syi * w];
+        const PixelColor *row0 = &src[(size_t)sy0 * w];
+        const PixelColor *row1 = &src[(size_t)sy1 * w];
 
         for (int dx = 0; dx < w; dx++) {
             double sx = baseX + dx * ratio;
-            if (rowValid && sx >= 0.0 && sx < (double)w) {
-                dst[dx] = srow[(int)sx];
+            if (rowValid && sx >= 0.0 && sx <= (double)(w - 1)) {
+                int sx0 = (int)sx;
+                int sx1 = sx0 + 1 < w ? sx0 + 1 : sx0;
+                double fx = sx - sx0;
+
+                double w00 = (1.0 - fx) * (1.0 - fy);
+                double w10 = fx * (1.0 - fy);
+                double w01 = (1.0 - fx) * fy;
+                double w11 = fx * fy;
+
+                PixelColor p00 = row0[sx0], p10 = row0[sx1];
+                PixelColor p01 = row1[sx0], p11 = row1[sx1];
+                PixelColor out = {
+                    (unsigned char)(w00 * p00.r + w10 * p10.r + w01 * p01.r + w11 * p11.r + 0.5),
+                    (unsigned char)(w00 * p00.g + w10 * p10.g + w01 * p01.g + w11 * p11.g + 0.5),
+                    (unsigned char)(w00 * p00.b + w10 * p10.b + w01 * p01.b + w11 * p11.b + 0.5),
+                };
+                dst[dx] = out;
             } else if (clear) {
                 PixelColor black = {0, 0, 0};
                 dst[dx] = black;
@@ -2796,10 +2826,12 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     if (dt > 0.1) dt = 0.1;
 
     // Advance the zoom, easing the speed by pipeline health: never outrun
-    // the rendered keyframes — slow down instead of stuttering.
+    // the rendered keyframes — slow down instead of stuttering. The slow
+    // blend makes speed changes read as camera work, not corrections
+    // (~1.25s time constant, Apple-style slow-motion ramps).
     double ready = mb_director_ready_log10(_cineDirector);
     double target = (ready - _cineZ) > MB_CINE_STEP * 1.5 ? _cineSpeed : 0.0;
-    double blend = dt * 3.0;
+    double blend = dt * 0.8;
     if (blend > 1.0) blend = 1.0;
     _cineCurSpeed += (target - _cineCurSpeed) * blend;
     _cineZ += _cineCurSpeed * dt;
@@ -2826,29 +2858,72 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     if (!lo && !hi) {
         memset(_framebuffer, 0, pixels * sizeof(PixelColor));
     } else {
-        double t = _cineZ / MB_CINE_STEP - floor(_cineZ / MB_CINE_STEP);
+        int kIdx = (int)floor(_cineZ / MB_CINE_STEP);
+        double t = _cineZ / MB_CINE_STEP - kIdx;
 
-        // Center path: lerp between the keyframe centers (retargeting moves
-        // them slightly); offsets computed in FloatExp, valid at any depth.
-        FloatExp dRe = fx_zero(), dIm = fx_zero();
+        // Camera path: Catmull-Rom spline through the keyframe centers
+        // around the playback position. A plain lerp is C0 only — the pan
+        // velocity snaps at every keyframe boundary, which is exactly what
+        // reads as "not cinematic". Positions are in lo-frame pixels,
+        // derived from FloatExp center deltas (valid at any depth).
+        double p0x = 0, p0y = 0, p2x = 0, p2y = 0, p3x = 0, p3y = 0;
+        bool have2 = false;
+
+        FloatExp sLo = lo ? mb_view_get_scale_fx(&lo->view) : fx_zero();
+
         if (lo && hi) {
+            FloatExp dRe, dIm;
             mb_view_hp_center_delta_fx(&lo->view, &hi->view, &dRe, &dIm);
+            p2x = fx_to_d(fx_div(dRe, sLo));
+            p2y = -fx_to_d(fx_div(dIm, sLo));
+            have2 = true;
+
+            const MBCineKeyframe *prev = mb_director_frame_at(_cineDirector, kIdx - 1);
+            if (prev) {
+                mb_view_hp_center_delta_fx(&lo->view, &prev->view, &dRe, &dIm);
+                p0x = fx_to_d(fx_div(dRe, sLo));
+                p0y = -fx_to_d(fx_div(dIm, sLo));
+            } else {
+                p0x = -p2x;   // linear extrapolation
+                p0y = -p2y;
+            }
+
+            const MBCineKeyframe *next = mb_director_frame_at(_cineDirector, kIdx + 2);
+            if (next) {
+                mb_view_hp_center_delta_fx(&lo->view, &next->view, &dRe, &dIm);
+                p3x = fx_to_d(fx_div(dRe, sLo));
+                p3y = -fx_to_d(fx_div(dIm, sLo));
+            } else {
+                p3x = 2.0 * p2x;
+                p3y = 2.0 * p2y;
+            }
+        }
+
+        // Catmull-Rom (p1 = lo center = origin of this coordinate frame)
+        double t2 = t * t, t3 = t2 * t;
+        double pcx = 0.5 * ((-p0x + p2x) * t +
+                            (2.0 * p0x - 5.0 * 0 + 4.0 * p2x - p3x) * t2 +
+                            (-p0x + 3.0 * 0 - 3.0 * p2x + p3x) * t3);
+        double pcy = 0.5 * ((-p0y + p2y) * t +
+                            (2.0 * p0y - 5.0 * 0 + 4.0 * p2y - p3y) * t2 +
+                            (-p0y + 3.0 * 0 - 3.0 * p2y + p3y) * t3);
+        if (!have2) {
+            pcx = 0.0;
+            pcy = 0.0;
         }
 
         if (lo) {
-            FloatExp sLo = mb_view_get_scale_fx(&lo->view);
-            double offX = fx_to_d(fx_div(fx_mul_d(dRe, t), sLo));
-            double offY = -fx_to_d(fx_div(fx_mul_d(dIm, t), sLo));
             [self blitCineFrame:lo->pixels ratio:pow(2.0, -t)
-                           offX:offX offY:offY clear:YES];
+                           offX:pcx offY:pcy clear:YES];
         } else {
             memset(_framebuffer, 0, pixels * sizeof(PixelColor));
         }
 
         if (hi) {
-            FloatExp sHi = mb_view_get_scale_fx(&hi->view);
-            double offX = fx_to_d(fx_div(fx_mul_d(dRe, t - 1.0), sHi));
-            double offY = -fx_to_d(fx_div(fx_mul_d(dIm, t - 1.0), sHi));
+            // Offsets relative to the hi center, in hi-frame pixels (its
+            // scale is half of lo's, so lo-frame pixels double).
+            double offX = (pcx - p2x) * 2.0;
+            double offY = (pcy - p2y) * 2.0;
             [self blitCineFrame:hi->pixels ratio:pow(2.0, 1.0 - t)
                            offX:offX offY:offY clear:NO];
         }

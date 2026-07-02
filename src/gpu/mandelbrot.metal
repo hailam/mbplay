@@ -208,6 +208,112 @@ kernel void mandelbrot_compute_perturb(
 // 64-bit doubles and needs no glitch markers thanks to rebasing.
 
 // =============================================================================
+// Float-float ("df") perturbation — GPU deep zoom without doubles
+// =============================================================================
+//
+// A value is a pair (hi, lo) of floats with hi+lo ~ 48-bit precision
+// (Dekker/Knuth error-free transformations, FMA-based). The float EXPONENT
+// range limits |dc| to >= ~1e-32, i.e. zoom up to ~1e30: within that window
+// this kernel matches the CPU double iteration to within +-1 count on
+// boundary pixels. Deeper zooms stay on the CPU (floatexp + BLA).
+//
+// Rebasing (Zhuoran) replaces glitch detection, exactly like the CPU loops.
+
+static float2 df_add(float2 a, float2 b) {
+    float s = a.x + b.x;
+    float bb = s - a.x;
+    float err = (a.x - (s - bb)) + (b.x - bb);
+    err += a.y + b.y;
+    float hi = s + err;
+    return float2(hi, err - (hi - s));
+}
+
+static float2 df_neg(float2 a) {
+    return float2(-a.x, -a.y);
+}
+
+static float2 df_sub(float2 a, float2 b) {
+    return df_add(a, df_neg(b));
+}
+
+static float2 df_mul(float2 a, float2 b) {
+    float p = a.x * b.x;
+    float e = fma(a.x, b.x, -p);   // exact low part of the product
+    e = fma(a.x, b.y, e);
+    e = fma(a.y, b.x, e);
+    float hi = p + e;
+    return float2(hi, e - (hi - p));
+}
+
+static float2 df_scale2(float2 a) {
+    return float2(a.x * 2.0f, a.y * 2.0f);   // exact
+}
+
+struct DfPerturbParams {
+    uint tile_size;
+    uint max_iter;
+    uint ref_len;
+    float dcx0_hi, dcx0_lo;    // dc at the tile origin (df)
+    float dcy0_hi, dcy0_lo;
+    float stepx_hi, stepx_lo;  // dc change per pixel column (df)
+    float stepy_hi, stepy_lo;  // dc change per pixel row (df, sign included)
+};
+
+kernel void mandelbrot_perturb_df(
+    device uint *iterations [[buffer(0)]],
+    device float *final_z2 [[buffer(1)]],
+    constant DfPerturbParams &p [[buffer(2)]],
+    constant float4 *ref [[buffer(3)]],   // (re_hi, re_lo, im_hi, im_lo)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= p.tile_size || gid.y >= p.tile_size) return;
+
+    float2 dcx = df_add(float2(p.dcx0_hi, p.dcx0_lo),
+                        df_mul(float2(p.stepx_hi, p.stepx_lo), float2((float)gid.x, 0.0f)));
+    float2 dcy = df_add(float2(p.dcy0_hi, p.dcy0_lo),
+                        df_mul(float2(p.stepy_hi, p.stepy_lo), float2((float)gid.y, 0.0f)));
+
+    float2 dx = float2(0.0f), dy = float2(0.0f);
+    uint m = 0;
+    uint n = 0;
+    float zmag = 0.0f;
+
+    for (; n < p.max_iter; n++) {
+        float4 Z = ref[m];
+        float2 zr = df_add(float2(Z.x, Z.y), dx);
+        float2 zi = df_add(float2(Z.z, Z.w), dy);
+        zmag = zr.x * zr.x + zi.x * zi.x;
+        if (zmag >= 4.0f) break;
+
+        float dmag = dx.x * dx.x + dy.x * dy.x;
+        if (m + 1 >= p.ref_len || zmag < dmag) {
+            // Rebase: Z_ref[0] == 0, so z re-expressed from index 0 is exact
+            dx = zr;
+            dy = zi;
+            Z = float4(0.0f);
+            m = 0;
+        }
+
+        float2 Zr = float2(Z.x, Z.y);
+        float2 Zi = float2(Z.z, Z.w);
+        // dz' = 2*Z*dz + dz^2 + dc
+        float2 t_re = df_sub(df_mul(Zr, dx), df_mul(Zi, dy));
+        float2 t_im = df_add(df_mul(Zr, dy), df_mul(Zi, dx));
+        float2 sq_re = df_sub(df_mul(dx, dx), df_mul(dy, dy));
+        float2 sq_im = df_scale2(df_mul(dx, dy));
+        float2 ndx = df_add(df_add(df_scale2(t_re), sq_re), dcx);
+        float2 ndy = df_add(df_add(df_scale2(t_im), sq_im), dcy);
+        dx = ndx;
+        dy = ndy;
+        m++;
+    }
+
+    uint idx = gid.y * p.tile_size + gid.x;
+    iterations[idx] = n;
+    final_z2[idx] = zmag;
+}
+
+// =============================================================================
 // Supersampled Kernels (2x2 MSAA)
 // =============================================================================
 

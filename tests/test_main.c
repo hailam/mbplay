@@ -10,6 +10,7 @@
 #include "../src/perturbation/bla.h"
 #include "../src/perturbation/deep_render.h"
 #include "../src/cinematic/director.h"
+#include "../src/gpu/gpu.h"
 #include "../src/precision/mp_real.h"
 #include "../src/precision/mp_complex.h"
 #include "../src/precision/view_hp.h"
@@ -775,6 +776,61 @@ static void test_pixel_complex_orientation(void) {
           "roundtrip failed: (400,100) -> (%d,%d)", px, py);
 }
 
+// GPU float-float perturbation must match the CPU double path (within +-2
+// counts on chaotic boundary pixels; df carries ~48-bit mantissas).
+static void test_gpu_df_matches_cpu(void) {
+    if (gpu_init_tiles(256, 1000) != 0 || gpu_init_perturbation(4096) != 0 ||
+        !gpu_df_available()) {
+        printf("  [gpu] no Metal device/pipeline — skipping df test\n");
+        return;
+    }
+
+    MBViewState view;
+    mb_view_state_init(&view, 512, 512);
+    mb_view_set_zoom_log10(&view, 20.0);   // inside the float-float window
+    mb_view_hp_set_center(&view,
+                          "-0.743643887037158704752191506114774",
+                          "0.131825904205311970493132056385139");
+    view.high_precision_mode = true;
+
+    MBDeepRenderer *r = mb_deep_renderer_create();
+    CHECK(r != NULL, "renderer create failed");
+
+    const int ts = 64;
+    uint32_t max_iter = mb_max_iter_for_zoom_log10(20.0);
+    uint32_t *cpu_it = malloc((size_t)ts * ts * sizeof(uint32_t));
+    uint32_t *gpu_it = malloc((size_t)ts * ts * sizeof(uint32_t));
+    CHECK(cpu_it && gpu_it, "alloc failed");
+
+    mb_deep_render_set_gpu_enabled(false);
+    int rc = mb_deep_renderer_probe_strided(r, &view, 1, 224, 224, ts, 1,
+                                            max_iter, cpu_it);
+    CHECK(rc == MB_DEEP_OK, "cpu probe failed");
+
+    mb_deep_render_set_gpu_enabled(true);
+    rc = mb_deep_renderer_probe_strided(r, &view, 2, 224, 224, ts, 1,
+                                        max_iter, gpu_it);
+    CHECK(rc == MB_DEEP_OK, "gpu probe failed");
+
+    int total = ts * ts, exact = 0, far = 0;
+    for (int i = 0; i < total; i++) {
+        uint32_t d = cpu_it[i] > gpu_it[i] ? cpu_it[i] - gpu_it[i]
+                                           : gpu_it[i] - cpu_it[i];
+        if (d == 0) exact++;
+        else if (d > 2) far++;
+        // Interior verdicts must agree
+        CHECK((cpu_it[i] >= max_iter) == (gpu_it[i] >= max_iter),
+              "interior verdict differs at %d (cpu=%u gpu=%u)", i, cpu_it[i], gpu_it[i]);
+    }
+    CHECK(exact * 100 >= total * 85, "gpu vs cpu: only %d/%d exact", exact, total);
+    CHECK(far * 100 <= total * 3, "gpu vs cpu: %d/%d far off", far, total);
+    printf("  [gpu] df vs cpu: %d/%d exact, %d far\n", exact, total, far);
+
+    free(cpu_it);
+    free(gpu_it);
+    mb_deep_renderer_destroy(r);
+}
+
 // The cinematic director: keyframes render, bracket correctly, pipeline
 // bounds itself, and steering keeps producing non-degenerate frames.
 static void test_cinematic_director(void) {
@@ -830,8 +886,10 @@ static void test_cinematic_director(void) {
 
 // Void regression: an autopilot dive must keep the set boundary in frame at
 // every keyframe — i.e. every keyframe's view contains BOTH interior and
-// escaping points. (The original steering chased any high count and could
-// wander into pure-exterior voids or dive into the interior.)
+// escaping points, and the escaping counts must not be a flat featureless
+// field. Runs at the real viewer viewport: the historical escapes (steering
+// oversteer at 10^3, budget blindness at 10^19) only reproduced at full
+// frame size, not at thumbnail sizes.
 static void test_cinematic_dive_stays_on_boundary(void) {
     MBRenderSettings settings = {
         .color_mode = MB_COLOR_MODE_CLASSIC,
@@ -840,7 +898,7 @@ static void test_cinematic_dive_stays_on_boundary(void) {
         .color_cycle_scale = 64.0f,
     };
 
-    const int W = 192, H = 128;
+    const int W = 1280, H = 800;
     MBDirector *d = mb_director_create(W, H, &settings);
     CHECK(d != NULL, "director create failed");
 
@@ -852,7 +910,9 @@ static void test_cinematic_dive_stays_on_boundary(void) {
     CHECK(checker != NULL, "checker renderer failed");
     uint32_t probe[24 * 24];
 
-    const int DIVE = 25;   // ~7.5 decades of autopilot
+    const int DIVE = 70;   // ~21 decades: crosses the budget-pressure zone
+    double frac_sum = 0.0;
+    int frac_frames = 0;
     for (int step = 0; step < DIVE; step++) {
         // Advance playback so the pipeline never reports full
         const MBCineKeyframe *lo = NULL, *hi = NULL;
@@ -863,13 +923,13 @@ static void test_cinematic_dive_stays_on_boundary(void) {
         CHECK(k == step, "keyframe %d failed (got %d)", step, k);
         if (k != step) break;
 
-        // Inspect the keyframe's view: both classes must be present
+        // Inspect the keyframe at the budget it actually rendered with
         mb_director_lock_frames(d, k * MB_CINE_STEP, &lo, &hi);
         CHECK(lo && lo->index == k, "keyframe %d not retrievable", k);
         MBViewState v = lo->view;
+        uint32_t max_iter = lo->max_iter;
         mb_director_unlock_frames(d);
 
-        uint32_t max_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&v));
         int span = W < H ? W : H;
         int probe_size = span - (span % 24);
         int rc = mb_deep_renderer_probe_strided(checker, &v, (uint64_t)(k + 1),
@@ -880,13 +940,45 @@ static void test_cinematic_dive_stays_on_boundary(void) {
         CHECK(rc == MB_DEEP_OK, "probe failed at keyframe %d", k);
 
         int interior = 0, escaped = 0;
+        uint32_t vmin = UINT32_MAX, vmax = 0;
         for (int i = 0; i < 24 * 24; i++) {
             if (probe[i] >= max_iter) interior++;
-            else escaped++;
+            else {
+                escaped++;
+                if (probe[i] < vmin) vmin = probe[i];
+                if (probe[i] > vmax) vmax = probe[i];
+            }
         }
         CHECK(interior > 0 && escaped > 0,
               "keyframe %d lost the boundary (interior=%d escaped=%d, zoom 10^%.1f)",
               k, interior, escaped, mb_view_zoom_log10(&v));
+
+        // A frame that has escapes but a flat count field is the "plain
+        // orange" failure: visually featureless even though not interior
+        if (escaped > 0 && interior == 0) {
+            double spread = (double)(vmax - vmin) / (double)(vmax + 1);
+            CHECK(spread >= 0.15,
+                  "keyframe %d is featureless exterior (counts %u..%u, zoom 10^%.1f)",
+                  k, vmin, vmax, mb_view_zoom_log10(&v));
+        }
+
+        // Track the interior fraction once steering has had time to settle
+        if (k >= 6) {
+            frac_sum += (double)interior / (24 * 24);
+            frac_frames++;
+        }
+    }
+
+    // The dive must not merely keep the boundary "somewhere in frame": a
+    // frame that is 95% smooth exterior is a bright featureless gradient.
+    // The steering regulates toward ~30-55% set, so the settled average has
+    // to be comfortably inside a broad band.
+    if (frac_frames > 0) {
+        double mean_frac = frac_sum / frac_frames;
+        CHECK(mean_frac > 0.12 && mean_frac < 0.80,
+              "dive settled on non-cinematic framing (mean interior %.0f%%)",
+              mean_frac * 100.0);
+        printf("  [cine] dive mean set coverage: %.0f%%\n", mean_frac * 100.0);
     }
 
     mb_deep_renderer_destroy(checker);
@@ -916,6 +1008,7 @@ int main(void) {
     test_zoom_clamps();
     test_iteration_scaling();
     test_pixel_complex_orientation();
+    test_gpu_df_matches_cpu();
     test_cinematic_director();
     test_cinematic_dive_stays_on_boundary();
     test_interior_black_with_custom_max_iter();

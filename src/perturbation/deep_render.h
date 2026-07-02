@@ -96,4 +96,11 @@ int mb_deep_renderer_probe_strided(MBDeepRenderer *r,
                                    uint32_t max_iter,
                                    uint32_t *iters_out);
 
+/**
+ * Enable/disable the GPU float-float fast path (default enabled; used by
+ * tiles in the zoom window where |dc| fits float exponent range). Exists
+ * mainly so tests can force CPU/GPU A/B comparisons.
+ */
+void mb_deep_render_set_gpu_enabled(bool enabled);
+
 #endif // MB_DEEP_RENDER_H

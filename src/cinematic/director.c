@@ -2,24 +2,34 @@
 #include "../perturbation/deep_render.h"
 #include "../precision/view_hp.h"
 #include "../precision/floatexp.h"
+#include "../mandelbrot/mandelbrot.h"
+#include "../color/color.h"
 
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <dispatch/dispatch.h>
+#include <stdatomic.h>
 
-// Steering probe: PROBE_GRID^2 samples over the central square of the next
-// keyframe's view.
+// Diagnostics for offline dive analysis (analyzer builds with -DMB_STEER_DEBUG)
+#ifdef MB_STEER_DEBUG
+#include <stdio.h>
+#define STEER_LOG(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define STEER_LOG(...) ((void)0)
+#endif
+
+// Steering probe: PROBE_GRID^2 samples over a square covering the frame.
 #define PROBE_GRID 24
-// Max retarget per keyframe, as a fraction of the viewport span. The zoom
-// doubles per keyframe, so a feature at pixel offset r drifts to 2(r - move)
-// by the next keyframe: tracking converges only when move > r/2, i.e. this
-// cap can hold features within half the central span. Kept at 1/4 so
-// consecutive keyframes still overlap enough for clean compositing.
-#define STEER_MAX_FRACTION 0.25
-// When the boundary has drifted far off-center ("lost"), allow one larger
-// catch-up move — a briefly rougher composite beats diving into a void.
+// Candidate next-window centers evaluated per axis (see steer_path).
+#define STEER_CANDIDATES 13
+// Retarget cap (fraction of the short span) for the no-escapes
+// reverse-course backstop, where there is no window to score.
 #define STEER_LOST_FRACTION 0.45
+// Ceiling for the adaptive iteration budget (matches the app-wide deep
+// render cap in mb_max_iter_for_zoom_log10).
+#define STEER_ITER_CEIL 524288u
 
 struct MBDirector {
     pthread_mutex_t lock;
@@ -41,10 +51,16 @@ struct MBDirector {
     double last_move_x, last_move_y;
     bool last_move_valid;
 
-    // Scratch (worker-owned)
-    PixelColor *tile_scratch;
+    // Adaptive iteration budget (worker-owned): raised when probe counts
+    // press against it, decayed when they fall far below. See steer_path.
+    uint32_t iter_budget;
+
+    // Scratch (worker-owned). One tile buffer per viewport tile: the tiles
+    // of a keyframe render CONCURRENTLY (the deep renderer is built for
+    // concurrent tile calls), which is where keyframe throughput comes from.
+    PixelColor **tile_scratch;   // tiles_total buffers
+    int tiles_x, tiles_y;
     uint32_t *probe_scratch;
-    uint32_t *sort_scratch;
 };
 
 MBDirector *mb_director_create(int width, int height,
@@ -58,17 +74,28 @@ MBDirector *mb_director_create(int width, int height,
     d->height = height;
     d->settings = *settings;
     d->renderer = mb_deep_renderer_create();
-    d->tile_scratch = malloc((size_t)MB_INTERACTIVE_TILE_SIZE * MB_INTERACTIVE_TILE_SIZE * sizeof(PixelColor));
+    d->tiles_x = (width + MB_INTERACTIVE_TILE_SIZE - 1) / MB_INTERACTIVE_TILE_SIZE;
+    d->tiles_y = (height + MB_INTERACTIVE_TILE_SIZE - 1) / MB_INTERACTIVE_TILE_SIZE;
+    int tiles_total = d->tiles_x * d->tiles_y;
+    d->tile_scratch = calloc((size_t)tiles_total, sizeof(PixelColor *));
     d->probe_scratch = malloc((size_t)PROBE_GRID * PROBE_GRID * sizeof(uint32_t));
-    d->sort_scratch = malloc((size_t)PROBE_GRID * PROBE_GRID * sizeof(uint32_t));
 
-    bool ok = d->renderer && d->tile_scratch && d->probe_scratch && d->sort_scratch &&
+    bool ok = d->renderer && d->tile_scratch && d->probe_scratch &&
               pthread_mutex_init(&d->lock, NULL) == 0;
+    if (ok) {
+        for (int i = 0; i < tiles_total; i++) {
+            d->tile_scratch[i] = malloc((size_t)MB_INTERACTIVE_TILE_SIZE *
+                                        MB_INTERACTIVE_TILE_SIZE * sizeof(PixelColor));
+            if (!d->tile_scratch[i]) ok = false;
+        }
+    }
     if (!ok) {
         if (d->renderer) mb_deep_renderer_destroy(d->renderer);
-        free(d->tile_scratch);
+        if (d->tile_scratch) {
+            for (int i = 0; i < tiles_total; i++) free(d->tile_scratch[i]);
+            free(d->tile_scratch);
+        }
         free(d->probe_scratch);
-        free(d->sort_scratch);
         free(d);
         return NULL;
     }
@@ -91,9 +118,11 @@ void mb_director_destroy(MBDirector *d) {
         free(d->slots[i].pixels);
     }
     if (d->renderer) mb_deep_renderer_destroy(d->renderer);
-    free(d->tile_scratch);
+    if (d->tile_scratch) {
+        for (int i = 0; i < d->tiles_x * d->tiles_y; i++) free(d->tile_scratch[i]);
+        free(d->tile_scratch);
+    }
     free(d->probe_scratch);
-    free(d->sort_scratch);
     pthread_mutex_destroy(&d->lock);
     free(d);
 }
@@ -111,6 +140,7 @@ void mb_director_start(MBDirector *d, const MBViewState *seed) {
     d->playback_index = d->next_index;
     d->first_keyframe = true;
     d->last_move_valid = false;
+    d->iter_budget = 0;
 
     for (int i = 0; i < MB_CINE_SLOTS; i++) {
         d->slots[i].ready = false;
@@ -120,19 +150,32 @@ void mb_director_start(MBDirector *d, const MBViewState *seed) {
     pthread_mutex_unlock(&d->lock);
 }
 
-// Keep the dive center pinned to the SET BOUNDARY — the only thing that has
-// structure at every depth. Targeting rules, in order of preference:
+// Keep the dive framed on the SET BOUNDARY by an inductive guarantee, not
+// by reactive nudging. Each keyframe the zoom doubles, so the next probe
+// sees the half-size window around whatever center we choose now. Constrain
+// the move to ±width/4, ±height/4: then every candidate next-window lies
+// INSIDE the current frame and can be scored directly from the current
+// probe grid. Pick the best-scoring window:
 //
-//   1. An INTERFACE sample: an escaping sample with an interior neighbor.
-//      The boundary passes between them, so aiming there keeps both classes
-//      in frame forever. Among interface samples, prefer the highest
-//      iteration count (tighter spirals), biased toward the frame center.
-//   2. No interior anywhere (pure exterior — a "void"): iteration counts are
-//      a potential function that rises toward the set, so chase the maximum
-//      count with an enlarged catch-up cap until the boundary re-enters.
-//   3. No escapes anywhere (deep interior): counts carry no gradient; back
-//      out toward the last known boundary direction is impossible without
-//      history, so hold course — rule 1 prevents ever getting here.
+//   - a window is scored by its COUNT CONTRAST: the log2 spread between
+//     the 10th and 90th percentile of its cells' iteration counts, with
+//     budget-capped cells scored as extra-deep. The boundary is exactly
+//     where counts span decades within a small region; flat exterior and
+//     solid (pseudo-)interior both have zero contrast. Percentiles make
+//     the score robust: capped DUST (noise cells at the budget contour,
+//     <10% of a window) is excluded by construction, so the steering
+//     tracks the persistent count gradient instead of chasing transient
+//     specks — chasing dust is a random walk that loses the dive. A
+//     window >90% capped has p90 == p10 == cap and scores zero, so the
+//     framing self-regulates to a mixed, visually rich composition.
+//
+// Induction: the seed frame contains the whole set; if the current frame
+// contains boundary structure, some feasible window contains it (the
+// feasible windows tile the entire frame), so the chosen frame does too —
+// the dive can never end up in a featureless region.
+//
+// "Interior" here means "did not escape within the budget", which includes
+// deep-boundary points — equally good steering targets.
 //
 // Probes at the keyframe's own zoom with generation 2k, right before the
 // tile pass at 2k+1: monotonic generations, and the probe's reference orbit
@@ -151,29 +194,55 @@ static void steer_path(MBDirector *d, int keyframe_index) {
     int stride = probe_size / PROBE_GRID;
     if (stride < 1) return;
 
-    uint32_t max_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&probe_view));
+    // ADAPTIVE iteration budget. The formula budget grows linearly with
+    // depth, but true counts near minibrot cascades grow much faster: the
+    // whole probe caps out, the steering goes blind, and a blind autopilot
+    // tunnels through the structure into flat exterior. When the escaping
+    // counts press against the budget, double it and re-probe (same view +
+    // generation, so orbit continuation makes the deeper pass incremental).
+    // Real interior never uncaps at ANY budget — "counts press against the
+    // ceiling" is what distinguishes a too-small budget from actual set.
+    uint32_t floor_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&probe_view));
+    uint32_t max_iter = floor_iter > d->iter_budget ? floor_iter : d->iter_budget;
     max_iter = (max_iter + 2047u) & ~2047u;
 
     int px0 = (d->width - probe_size) / 2;
     int py0 = (d->height - probe_size) / 2;
-    if (mb_deep_renderer_probe_strided(d->renderer, &probe_view,
-                                       (uint64_t)keyframe_index * 2,
-                                       px0, py0, probe_size, stride,
-                                       max_iter, d->probe_scratch) != MB_DEEP_OK) {
-        return;
+
+    int escaped = 0;
+    uint32_t vmax = 0;
+    for (;;) {
+        if (mb_deep_renderer_probe_strided(d->renderer, &probe_view,
+                                           (uint64_t)keyframe_index * 2,
+                                           px0, py0, probe_size, stride,
+                                           max_iter, d->probe_scratch) != MB_DEEP_OK) {
+            return;
+        }
+        escaped = 0;
+        vmax = 0;
+        for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
+            uint32_t v = d->probe_scratch[i];
+            if (v < max_iter) {
+                escaped++;
+                if (v > vmax) vmax = v;
+            }
+        }
+        int capped = PROBE_GRID * PROBE_GRID - escaped;
+        bool blindish = capped * 5 > PROBE_GRID * PROBE_GRID * 3;   // >60% capped
+        bool pressing = escaped == 0 || vmax >= max_iter - max_iter / 4;
+        if (!blindish || !pressing || max_iter >= STEER_ITER_CEIL) break;
+        max_iter *= 2;
     }
+    // Decay when over-provisioned: capped cells are then REAL interior, and
+    // every rendered interior pixel burns the whole budget.
+    if (escaped > 0 && vmax < max_iter / 4) {
+        uint32_t want = vmax * 2 > floor_iter ? vmax * 2 : floor_iter;
+        want = (want + 2047u) & ~2047u;
+        if (want < max_iter) max_iter = want;
+    }
+    d->iter_budget = max_iter;
 
     const uint32_t *it = d->probe_scratch;
-    double half_grid = (PROBE_GRID - 1) / 2.0;
-
-    // Classify: "interior" here means "did not escape within the budget" —
-    // which includes deep-boundary points, so it grows as the zoom outruns
-    // the budget. The regulator below holds its frame fraction steady.
-    int interior = 0, escaped = 0;
-    for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
-        if (it[i] >= max_iter) interior++;
-        else d->sort_scratch[escaped++] = it[i];
-    }
 
     double mx, my;
 
@@ -187,74 +256,106 @@ static void steer_path(MBDirector *d, int keyframe_index) {
         mx = -d->last_move_x / mag * cap;
         my = -d->last_move_y / mag * cap;
     } else {
-        double f = (double)interior / (PROBE_GRID * PROBE_GRID);
-        bool far_off = f < 0.12 || f > 0.70;
-
-        // The attractor is the iteration-count contour JUST OUTSIDE the set
-        // (a high quantile of the escaped counts). It is strictly exterior,
-        // so aiming at it never sinks into the (pseudo-)interior, yet it
-        // hugs the boundary, so approaching it from a void pulls the set
-        // back into frame. No quantile switching: the same contour attracts
-        // correctly from both sides.
-        for (int i = 1; i < escaped; i++) {   // insertion sort (<=576 items)
-            uint32_t v = d->sort_scratch[i];
-            int j = i - 1;
-            while (j >= 0 && d->sort_scratch[j] > v) {
-                d->sort_scratch[j + 1] = d->sort_scratch[j];
-                j--;
-            }
-            d->sort_scratch[j + 1] = v;
+        // Score every feasible next-window placement. Screen coords (y
+        // down) throughout; flipped once at the end for the translate.
+        // Per-cell log2 counts computed once; capped cells score as
+        // extra-deep so real set presence reads as maximum depth.
+        double cell_log[PROBE_GRID * PROBE_GRID];
+        double cap_log = log2((double)max_iter * 4.0);
+        for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
+            uint32_t v = it[i];
+            cell_log[i] = v >= max_iter ? cap_log : log2((double)v + 1.0);
         }
-        uint32_t contour = d->sort_scratch[(int)(0.9 * (escaped - 1))];
 
-        double best_score = -1.0;
-        int best_x = 0, best_y = 0;
-        for (int gy = 0; gy < PROBE_GRID; gy++) {
-            for (int gx = 0; gx < PROBE_GRID; gx++) {
-                uint32_t v = it[gy * PROBE_GRID + gx];
-                if (v >= max_iter) continue;
+        double max_ox = d->width / 4.0, max_oy = d->height / 4.0;
+        double max_dist = hypot(max_ox, max_oy);
+        double best_score = -1e30, best_ox = 0.0, best_oy = 0.0;
 
-                double score;
-                double dist = v > contour ? (double)(v - contour)
-                                          : (double)(contour - v);
-                if (f < 0.12) {
-                    // Void: the count field is nearly flat and rises toward
-                    // the set — pure gradient chase (center bias would pin
-                    // the dive to a featureless middle).
-                    score = (double)v;
-                } else if (f > 0.70) {
-                    // Drowning in (pseudo-)interior: escaped samples sit
-                    // toward the frame edge; ride the contour out to them.
-                    // No center bias (it points the wrong way), and NOT the
-                    // max count (that walks deeper into the blob).
-                    score = 1.0 / (1.0 + dist / (contour * 0.05 + 1.0));
-                } else {
-                    double ddx = (gx - half_grid) / half_grid;
-                    double ddy = (gy - half_grid) / half_grid;
-                    double bias = 1.0 / (1.0 + 0.5 * (ddx * ddx + ddy * ddy));
-                    score = bias / (1.0 + dist / (contour * 0.05 + 1.0));
+        for (int cy = 0; cy < STEER_CANDIDATES; cy++) {
+            for (int cx = 0; cx < STEER_CANDIDATES; cx++) {
+                double ox = (cx / (STEER_CANDIDATES - 1.0) * 2.0 - 1.0) * max_ox;
+                double oy = (cy / (STEER_CANDIDATES - 1.0) * 2.0 - 1.0) * max_oy;
+                double wcx = d->width / 2.0 + ox;
+                double wcy = d->height / 2.0 + oy;
+
+                double vals[PROBE_GRID * PROBE_GRID];
+                int n = 0, n_int = 0;
+                for (int gy = 0; gy < PROBE_GRID; gy++) {
+                    double sy = py0 + (gy + 0.5) * stride;
+                    if (fabs(sy - wcy) > d->height / 4.0) continue;
+                    for (int gx = 0; gx < PROBE_GRID; gx++) {
+                        double sx = px0 + (gx + 0.5) * stride;
+                        if (fabs(sx - wcx) > d->width / 4.0) continue;
+                        int i = gy * PROBE_GRID + gx;
+                        vals[n++] = cell_log[i];
+                        if (it[i] >= max_iter) n_int++;
+                    }
                 }
+                if (n == 0) continue;
+
+                // Insertion sort (n is small)
+                for (int a = 1; a < n; a++) {
+                    double key = vals[a];
+                    int b = a - 1;
+                    while (b >= 0 && vals[b] > key) {
+                        vals[b + 1] = vals[b];
+                        b--;
+                    }
+                    vals[b + 1] = key;
+                }
+                // Contrast (p90 - p10, in doublings of iteration count)
+                // keeps a shallow reference in frame for visual shape.
+                double contrast = vals[n - 1 - n / 10] - vals[n / 10];
+                // DEEP PULL: mean of the top quartile — a REGION attractor
+                // toward the deepest counts. This is the dominant term: it
+                // is continuous (no capped-mass threshold to fall off),
+                // robust to single-cell dust, and always points up the
+                // potential gradient toward the set, so the window tracks
+                // the one thing that persists under zoom.
+                int q = n / 4;
+                if (q < 1) q = 1;
+                double deep = 0.0;
+                for (int a = n - q; a < n; a++) deep += vals[a];
+                deep /= q;
+
+                double score = deep + contrast
+                             - 1.0 * fabs((double)n_int / n - 0.30)
+                             - 0.30 * hypot(ox, oy) / max_dist;
+
                 if (score > best_score) {
                     best_score = score;
-                    best_x = gx;
-                    best_y = gy;
+                    best_ox = ox;
+                    best_oy = oy;
                 }
             }
         }
 
-        double off_x = px0 + (best_x + 0.5) * stride - d->width / 2.0;
-        double off_y_up = d->height / 2.0 - (py0 + (best_y + 0.5) * stride);
+        mx = best_ox;
+        my = -best_oy;   // screen y-down -> translate y-up
 
-        // Move 3/4 of the way (geometric convergence against the 2x zoom
-        // per keyframe), with a larger cap when far off equilibrium.
-        double cap = (far_off ? STEER_LOST_FRACTION : STEER_MAX_FRACTION) * span;
-        mx = off_x * 0.75;
-        my = off_y_up * 0.75;
-        double mag = hypot(mx, my);
-        if (mag > cap) {
-            mx *= cap / mag;
-            my *= cap / mag;
+#ifdef MB_STEER_DEBUG
+        {
+            int g_int = PROBE_GRID * PROBE_GRID - escaped;
+            // re-score the chosen window for the log
+            double wcx = d->width / 2.0 + best_ox, wcy = d->height / 2.0 + best_oy;
+            int n = 0, n_int = 0;
+            for (int gy = 0; gy < PROBE_GRID; gy++) {
+                double sy = py0 + (gy + 0.5) * stride;
+                if (fabs(sy - wcy) > d->height / 4.0) continue;
+                for (int gx = 0; gx < PROBE_GRID; gx++) {
+                    double sx = px0 + (gx + 0.5) * stride;
+                    if (fabs(sx - wcx) > d->width / 4.0) continue;
+                    n++;
+                    if (it[gy * PROBE_GRID + gx] >= max_iter) n_int++;
+                }
+            }
+            STEER_LOG("[steer] k=%d budget=%u grid_int=%d/%d move=(%+.0f,%+.0f) "
+                      "win_f=%.2f score=%.2f vmax=%u\n",
+                      keyframe_index, max_iter, g_int, PROBE_GRID * PROBE_GRID,
+                      best_ox, best_oy, n ? (double)n_int / n : -1.0,
+                      best_score, vmax);
         }
+#endif
     }
 
     d->last_move_x = mx;
@@ -293,35 +394,88 @@ int mb_director_render_next(MBDirector *d) {
     mb_view_set_zoom_log10(&view, k * MB_CINE_STEP);
     view.high_precision_mode = mb_view_needs_high_precision(&view);
 
+    // Adaptive budget from the steering probe: without it, regions whose
+    // true counts outrun the formula render as featureless budget-black.
     uint32_t max_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&view));
+    if (max_iter < d->iter_budget) max_iter = d->iter_budget;
     max_iter = (max_iter + 2047u) & ~2047u;
 
-    // Render the full frame as tiles into the slot buffer
+    // Render the frame's tiles CONCURRENTLY (the deep renderer shares one
+    // refcounted reference orbit across threads; the first tile builds or
+    // reuses it, the rest proceed in parallel). Keyframe throughput scales
+    // with cores, which is what sets the maximum sustainable zoom speed.
     int ts = MB_INTERACTIVE_TILE_SIZE;
-    for (int ty = 0; ty * ts < d->height; ty++) {
-        for (int tx = 0; tx * ts < d->width; tx++) {
-            int rc = mb_deep_renderer_render_tile(d->renderer, &view,
-                                                  (uint64_t)k * 2 + 1,
-                                                  tx * ts, ty * ts, ts,
-                                                  max_iter, &d->settings,
-                                                  d->tile_scratch);
-            if (rc != MB_DEEP_OK) {
-                return -1;
+    size_t tiles_total = (size_t)d->tiles_x * d->tiles_y;
+    _Atomic int failed = 0;
+    _Atomic int *failedp = &failed;   // blocks capture by const copy
+
+    // Below the deep threshold, doubles address every pixel exactly: render
+    // tiles directly with the SIMD pair path — no reference orbit, no BLA
+    // lookup overhead. Perturbation takes over where doubles cannot.
+    bool shallow = view.zoom_level < MB_DEEP_ZOOM_THRESHOLD;
+
+    MBDirector *dd = d;
+    MBViewState *viewp = &view;
+    MBCineKeyframe *slotp = slot;
+    uint32_t mi = max_iter;
+    int kk = k;
+    dispatch_apply(tiles_total,
+                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t i) {
+        if (atomic_load(failedp)) return;
+        int tx = (int)(i % dd->tiles_x);
+        int ty = (int)(i / dd->tiles_x);
+        PixelColor *scratch = dd->tile_scratch[i];
+
+        if (shallow) {
+            double scale = mb_view_get_scale(viewp);
+            double half_w = dd->width / 2.0;
+            double half_h = dd->height / 2.0;
+            for (int ly = 0; ly < ts; ly++) {
+                int py = ty * ts + ly;
+                // Screen py grows downward, imaginary axis grows upward
+                double cy = viewp->center_y + (half_h - py) * scale;
+                for (int lx = 0; lx < ts; lx += 2) {
+                    int px = tx * ts + lx;
+                    double cx0 = viewp->center_x + (px - half_w) * scale;
+                    double cx1 = viewp->center_x + (px + 1 - half_w) * scale;
+                    unsigned int i0, i1;
+                    float z0, z1;
+                    mb_compute_pair_smooth(cx0, cy, cx1, cy, mi, &i0, &i1, &z0, &z1);
+                    color_from_iteration_ex(&scratch[(size_t)ly * ts + lx],
+                                            i0, z0, mi, &dd->settings);
+                    color_from_iteration_ex(&scratch[(size_t)ly * ts + lx + 1],
+                                            i1, z1, mi, &dd->settings);
+                }
             }
-            int copy_w = d->width - tx * ts;
-            if (copy_w > ts) copy_w = ts;
-            int copy_h = d->height - ty * ts;
-            if (copy_h > ts) copy_h = ts;
-            for (int row = 0; row < copy_h; row++) {
-                memcpy(&slot->pixels[(size_t)(ty * ts + row) * d->width + tx * ts],
-                       &d->tile_scratch[(size_t)row * ts],
-                       (size_t)copy_w * sizeof(PixelColor));
+        } else {
+            int rc = mb_deep_renderer_render_tile(dd->renderer, viewp,
+                                                  (uint64_t)kk * 2 + 1,
+                                                  tx * ts, ty * ts, ts,
+                                                  mi, &dd->settings, scratch);
+            if (rc != MB_DEEP_OK) {
+                atomic_store(failedp, 1);
+                return;
             }
         }
+        int copy_w = dd->width - tx * ts;
+        if (copy_w > ts) copy_w = ts;
+        int copy_h = dd->height - ty * ts;
+        if (copy_h > ts) copy_h = ts;
+        for (int row = 0; row < copy_h; row++) {
+            memcpy(&slotp->pixels[(size_t)(ty * ts + row) * dd->width + tx * ts],
+                   &scratch[(size_t)row * ts],
+                   (size_t)copy_w * sizeof(PixelColor));
+        }
+    });
+
+    if (atomic_load(&failed)) {
+        return -1;
     }
 
     pthread_mutex_lock(&d->lock);
     slot->view = view;
+    slot->max_iter = max_iter;
     slot->ready = true;
     d->next_index = k + 1;
     d->first_keyframe = false;
@@ -342,6 +496,12 @@ void mb_director_lock_frames(MBDirector *d, double zoom_log10,
     const MBCineKeyframe *b = &d->slots[(k + 1) % MB_CINE_SLOTS];
     *lo = (a->ready && a->index == k) ? a : NULL;
     *hi = (b->ready && b->index == k + 1) ? b : NULL;
+}
+
+const MBCineKeyframe *mb_director_frame_at(MBDirector *d, int index) {
+    if (index < 0) return NULL;
+    const MBCineKeyframe *s = &d->slots[index % MB_CINE_SLOTS];
+    return (s->ready && s->index == index) ? s : NULL;
 }
 
 void mb_director_unlock_frames(MBDirector *d) {

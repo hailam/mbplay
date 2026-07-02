@@ -199,7 +199,7 @@ target("mandelbrotplay_c")
 target("mandelbrot_tests")
     set_kind("binary")
     set_languages("c17")
-    add_rules("build_flags")
+    add_rules("metal2header", "build_flags")
     set_default(false)
 
     add_files("tests/test_main.c")
@@ -208,8 +208,25 @@ target("mandelbrot_tests")
     add_files("src/perturbation/*.c")
     add_files("src/precision/*.c")
     add_files("src/cinematic/*.c")
+    add_files("src/gpu/*.c")
+    add_files("src/gpu/*.m")
 
-    add_packages("gmp", "mpfr")
+    -- CMT Objective-C sources (compiled from package install dir)
+    on_load(function (target)
+        local cmt = target:pkg("cmt")
+        if cmt then
+            local cmt_src = path.join(cmt:installdir(), "src")
+            target:add("files", path.join(cmt_src, "*.m"))
+            target:add("includedirs", path.join(cmt:installdir(), "include"))
+        end
+    end)
+    add_mxflags("-fno-objc-arc", {force = true})
+
+    if is_plat("macosx") then
+        add_frameworks("Metal", "Foundation", "QuartzCore")
+    end
+
+    add_packages("gmp", "mpfr", "cmt")
     add_includedirs("src")
     set_optimize("fastest")
 
@@ -221,6 +238,8 @@ target("mandelbrot_interactive")
     set_kind("binary")
     set_languages("c17", "c++17")
     add_rules("metal2header", "build_flags")
+    -- Keep symbols in release: crash reports must symbolicate
+    set_symbols("debug")
     -- Build-order dependency only (binaries don't link each other): keeps
     -- the CLI building on plain `xmake` while `xmake run` targets just this.
     add_deps("mandelbrotplay_c")

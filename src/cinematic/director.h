@@ -29,6 +29,7 @@ typedef struct MBDirector MBDirector;
 typedef struct {
     PixelColor *pixels;   // width x height, screen layout
     MBViewState view;     // snapshot the keyframe was rendered with
+    uint32_t max_iter;    // iteration budget the keyframe rendered with
     int index;            // keyframe index k: zoom_log10 = k * log10(2)
     bool ready;
 } MBCineKeyframe;
@@ -66,6 +67,14 @@ int mb_director_render_next(MBDirector *d);
  */
 void mb_director_lock_frames(MBDirector *d, double zoom_log10,
                              const MBCineKeyframe **lo, const MBCineKeyframe **hi);
+
+/**
+ * Fetch any keyframe by index while the director is LOCKED (between
+ * lock_frames and unlock_frames). NULL if not resident. Used to gather the
+ * neighbors around the playback position for spline interpolation of the
+ * camera path.
+ */
+const MBCineKeyframe *mb_director_frame_at(MBDirector *d, int index);
 
 void mb_director_unlock_frames(MBDirector *d);
 

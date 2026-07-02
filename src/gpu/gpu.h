@@ -258,6 +258,30 @@ void gpu_compute_tile_supersampled(const GPUTileParams *params,
                                    const MBRenderSettings *settings);
 
 // =============================================================================
+// Float-float ("df") GPU perturbation
+// =============================================================================
+//
+// Paired-float (~48-bit) delta iteration with rebasing, for the deep-zoom
+// window where |dc| still fits float exponent range (zoom up to ~1e30).
+// Matches the CPU double iteration within +-1 count on boundary pixels.
+
+/** True when the df pipeline is ready (device present, kernel compiled). */
+bool gpu_df_available(void);
+
+/**
+ * Iterate one tile on the GPU. Thread-safe (serializes internally); the
+ * reference orbit is re-uploaded only when (ref_re, ref_len) changes.
+ * dc for pixel (x, y) = (dc0x + x*step_x, dc0y + y*step_y).
+ *
+ * @return 0 on success; -1 when unavailable or the tile/orbit exceeds the
+ *         preallocated buffers (caller falls back to the CPU path).
+ */
+int gpu_perturb_df_tile(const double *ref_re, const double *ref_im, uint32_t ref_len,
+                        double dc0x, double dc0y, double step_x, double step_y,
+                        uint32_t tile_size, uint32_t max_iter,
+                        uint32_t *iterations, float *final_z2);
+
+// =============================================================================
 // High-Precision Delta Computation API
 // =============================================================================
 
