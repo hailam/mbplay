@@ -1,4 +1,5 @@
 #include "director.h"
+#include "nucleus.h"
 #include "../perturbation/deep_render.h"
 #include "../precision/view_hp.h"
 #include "../precision/floatexp.h"
@@ -21,9 +22,22 @@
 #endif
 
 // Steering probe: PROBE_GRID^2 samples over a square covering the frame.
-#define PROBE_GRID 24
+// Fine enough that hairline filaments (the deep structure at depth) don't
+// slip between samples too easily — they are invisible at ANY budget once
+// they fall between cells.
+#define PROBE_GRID 32
 // Candidate next-window centers evaluated per axis (see steer_path).
-#define STEER_CANDIDATES 13
+#define STEER_CANDIDATES 17
+// Candidate offsets reach +-STEER_REACH_FRACTION * span in BOTH axes. The
+// zoom doubles per keyframe, so a feature at offset p is at 2(p - move)
+// next frame: the trackable region is |p| < 2*move_max. Reach must exceed
+// span/4 * (long/short ratio considerations) so that 2*reach covers the
+// whole frame — otherwise structure in the frame's outer third can be held
+// at the edge but never re-centered, and one probe-noise wobble loses it.
+#define STEER_REACH_FRACTION 0.42
+// Moves beyond this knee cost extra: normal tracking stays gentle (smooth
+// camera), larger catch-up moves fire only on a decisive deep differential.
+#define STEER_KNEE_FRACTION 0.25
 // Retarget cap (fraction of the short span) for the no-escapes
 // reverse-course backstop, where there is no window to score.
 #define STEER_LOST_FRACTION 0.45
@@ -54,6 +68,40 @@ struct MBDirector {
     // Adaptive iteration budget (worker-owned): raised when probe counts
     // press against it, decayed when they fall far below. See steer_path.
     uint32_t iter_budget;
+
+    // Visual RENDER budget (worker-owned): ~2x the p95 of escaping probe
+    // counts. Probes must resolve the deepest fringe (they are 1024 cells
+    // — the steering's eyes), but interior pixels burn the whole render
+    // budget per frame: tying rendering to the fringe max makes boundary
+    // orbits unaffordable. The >p95 sliver renders as set-black.
+    uint32_t render_budget;
+
+    // Capped probe fraction verified as REAL set (a budget doubling failed
+    // to collapse it). Raising the budget past real interior is pure waste:
+    // it never uncaps. Worker-owned.
+    double real_frac;
+
+    // Nucleus target lock (worker-owned): a FIXED minibrot coordinate the
+    // camera flies toward geometrically. Field-following chases what the
+    // probe sees and can be outrun by structure receding at the zoom rate;
+    // a fixed coordinate cannot recede. See steer_nucleus.
+    char target_x[MB_HP_COORD_STR_LEN];
+    char target_y[MB_HP_COORD_STR_LEN];
+    bool target_valid;
+    uint32_t target_period;
+    int retarget_cooldown;        // keyframes to skip Newton after a failure
+    uint32_t retarget_min_period; // skip |z| dips at/below this when locking:
+                                  // raised past a parent nucleus so the next
+                                  // lock finds the EMBEDDED minibrot beyond it
+
+    // ANCHOR: the last successfully locked nucleus, never cleared on veer.
+    // When embedded periods outgrow the Newton budget (locks become
+    // unaffordable at depth), the dive descends onto THIS minibrot's
+    // boundary instead — an exact coordinate whose boundary is the whole
+    // Mandelbrot boundary in miniature: infinitely deep at any zoom.
+    char anchor_x[MB_HP_COORD_STR_LEN];
+    char anchor_y[MB_HP_COORD_STR_LEN];
+    bool anchor_valid;
 
     // Scratch (worker-owned). One tile buffer per viewport tile: the tiles
     // of a keyframe render CONCURRENTLY (the deep renderer is built for
@@ -141,6 +189,13 @@ void mb_director_start(MBDirector *d, const MBViewState *seed) {
     d->first_keyframe = true;
     d->last_move_valid = false;
     d->iter_budget = 0;
+    d->render_budget = 0;
+    d->real_frac = 0.0;
+    d->target_valid = false;
+    d->target_period = 0;
+    d->retarget_cooldown = 0;
+    d->retarget_min_period = 0;
+    d->anchor_valid = false;
 
     for (int i = 0; i < MB_CINE_SLOTS; i++) {
         d->slots[i].ready = false;
@@ -150,12 +205,253 @@ void mb_director_start(MBDirector *d, const MBViewState *seed) {
     pthread_mutex_unlock(&d->lock);
 }
 
-// Keep the dive framed on the SET BOUNDARY by an inductive guarantee, not
-// by reactive nudging. Each keyframe the zoom doubles, so the next probe
-// sees the half-size window around whatever center we choose now. Constrain
-// the move to ±width/4, ±height/4: then every candidate next-window lies
-// INSIDE the current frame and can be scored directly from the current
-// probe grid. Pick the best-scoring window:
+// Zoom depth where nucleus targeting engages. Shallower, window steering
+// is reliable and nucleus locks degenerate (cardioid/bulb centers are
+// featureless interior).
+#define STEER_NUCLEUS_MIN_LOG10 3.0
+
+// BOUNDARY ORBIT — the deep-dive endgame. Descend onto the anchor
+// minibrot's boundary: hold its interior at a visual setpoint by moving
+// radially along the EXACT anchor direction (toward when too little set
+// shows, away when too much), plus a slow tangential drift that makes the
+// descent a spiral. Anchored to an exact coordinate, valid at any depth,
+// needs no further Newton locks. Returns false only without an anchor.
+static bool steer_boundary_orbit(MBDirector *d, const MBViewState *pv,
+                                 double capped_frac, int span, double reach,
+                                 double *out_mx, double *out_my) {
+    if (!d->anchor_valid) return false;
+
+    MBViewState av = *pv;
+    if (mb_view_hp_set_center(&av, d->anchor_x, d->anchor_y) != 0) {
+        d->anchor_valid = false;
+        return false;
+    }
+    FloatExp scale = mb_view_get_scale_fx(pv);
+    FloatExp dRe, dIm;
+    mb_view_hp_center_delta_fx(pv, &av, &dRe, &dIm);
+    double ax = fx_to_d(fx_div(dRe, scale));
+    double ay = fx_to_d(fx_div(dIm, scale));
+    double dist = hypot(ax, ay);
+    if (!(dist > 1e-9) || !isfinite(dist)) {
+        // Sitting exactly on the nucleus: step off in any direction
+        ax = 1.0;
+        ay = 0.0;
+        dist = 1.0;
+    }
+    double ux = ax / dist, uy = ay / dist;
+
+    // PROPORTIONAL radial control on the visible set fraction. The
+    // boundary-distance error doubles every keyframe like everything
+    // else, so a dead-band controller silently lets it explode while
+    // "in band" — correction must be continuous, every frame, with gain
+    // above the 0.5 that stabilizes the doubling map. The capped
+    // fraction is frame-relative, so the same law holds at any depth.
+    double err = 0.28 - capped_frac;   // +: too little set, go toward
+    double radial = 1.5 * err * span;
+    double lim = capped_frac <= 0.001 ? 0.85 * span : reach;  // emergency
+    if (radial > lim) radial = lim;
+    if (radial < -lim) radial = -lim;
+    if (radial > 0.5 * dist) radial = 0.5 * dist;   // don't overshoot
+    // Tangential drift: the spiral
+    double tang = 0.05 * span;
+
+    double mx = radial * ux + tang * -uy;
+    double my = radial * uy + tang * ux;
+    double mag = hypot(mx, my);
+    if (mag > lim) {
+        mx *= lim / mag;
+        my *= lim / mag;
+    }
+    *out_mx = mx;
+    *out_my = my;
+    STEER_LOG("[steer] ORBIT dist=%.0fpx capped=%.2f radial=%.0f\n",
+              dist, capped_frac, radial);
+    return true;
+}
+
+// NUCLEUS TARGETING — the deep-dive backbone. Lock the superstable center
+// of the minibrot that owns the deepest visible neighborhood (period
+// detection + Newton, see nucleus.c) and fly toward that FIXED coordinate.
+// A fixed target cannot be outrun; en route the frame shows the filament
+// cascade leading to it, on arrival the minibrot grows until it fills the
+// resolved frame, then the next embedded structure is locked — the classic
+// infinite minibrot descent. Returns true with a move when a target is
+// held or freshly locked; false hands the frame to window steering.
+static bool steer_nucleus(MBDirector *d, const MBViewState *pv,
+                          const uint32_t *it, uint32_t max_iter,
+                          double capped_frac,
+                          int px0, int py0, int stride,
+                          int span, double reach,
+                          double *out_mx, double *out_my) {
+    FloatExp scale = mb_view_get_scale_fx(pv);
+
+    if (d->target_valid) {
+        MBViewState tv = *pv;
+        if (mb_view_hp_set_center(&tv, d->target_x, d->target_y) != 0) {
+            d->target_valid = false;
+        } else {
+            FloatExp dRe, dIm;
+            mb_view_hp_center_delta_fx(pv, &tv, &dRe, &dIm);
+            double px = fx_to_d(fx_div(dRe, scale));
+            double py_up = fx_to_d(fx_div(dIm, scale));
+            double dist = hypot(px, py_up);
+            if (dist > 4.0 * span) {
+                d->target_valid = false;   // impossibly far: stale lock
+            } else if ((dist < span / 4.0 && capped_frac > 0.05) ||
+                       capped_frac > 0.25) {
+                // VEER EARLY: the locked minibrot's interior has appeared.
+                // Sitting atop a nucleus explodes iteration counts (the
+                // budget chases them to the ceiling, the frame drowns in
+                // set) — hand off to the next embedded target NOW, and
+                // skip the parent's |z| dips so Newton cannot relock it.
+                // The second clause fires MID-FLIGHT: on a long approach a
+                // real minibrot balloons before the camera ever centers
+                // it, and waiting for arrival lets it swallow the frame.
+                d->target_valid = false;
+                if (d->target_period > d->retarget_min_period) {
+                    d->retarget_min_period = d->target_period;
+                }
+                STEER_LOG("[steer] VEER capped=%.2f dist=%.0f min_period=%u\n",
+                          capped_frac, dist, d->retarget_min_period);
+            } else {
+                // Far targets get emergency catch-up speed: a feature at
+                // offset p recedes to 2(p - move), so beyond 2*reach the
+                // normal cap diverges. One briefly rougher composite
+                // beats discarding a valid nucleus.
+                double lim = dist > 1.5 * reach ? 0.85 * span : reach;
+                double f = dist > lim ? lim / dist : 1.0;
+                *out_mx = px * f;
+                *out_my = py_up * f;
+                STEER_LOG("[steer] FLY dist=%.0fpx capped=%.2f\n",
+                          dist, capped_frac);
+                return true;
+            }
+        }
+    }
+
+    if (d->retarget_cooldown > 0) {
+        d->retarget_cooldown--;
+        return false;
+    }
+
+    // Guess: the deepest ESCAPING cell — embedded structure whose nucleus
+    // lies deeper than wherever we are. Cells hugging the capped interior
+    // are dominated by the parent minibrot's atom (Newton just relocks
+    // it), so prefer deep cells with no capped neighbor; fall back to the
+    // global deepest if the frame has no such cell.
+    uint32_t best = 0, best_any = 0;
+    int bi = -1, bi_any = -1;
+    for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
+        uint32_t v = it[i];
+        if (v >= max_iter) continue;
+        if (v > best_any) {
+            best_any = v;
+            bi_any = i;
+        }
+        if (v > best) {
+            int gx = i % PROBE_GRID, gy = i / PROBE_GRID;
+            bool near_capped = false;
+            for (int oy = -1; oy <= 1 && !near_capped; oy++) {
+                for (int ox = -1; ox <= 1; ox++) {
+                    int nxg = gx + ox, nyg = gy + oy;
+                    if (nxg < 0 || nxg >= PROBE_GRID ||
+                        nyg < 0 || nyg >= PROBE_GRID) continue;
+                    if (it[nyg * PROBE_GRID + nxg] >= max_iter) {
+                        near_capped = true;
+                        break;
+                    }
+                }
+            }
+            if (!near_capped) {
+                best = v;
+                bi = i;
+            }
+        }
+    }
+    if (bi < 0) bi = bi_any;
+    if (bi < 0) return false;
+    uint32_t guess_count = it[bi];
+    double sx = px0 + (bi % PROBE_GRID + 0.5) * stride;
+    double sy = py0 + (bi / PROBE_GRID + 0.5) * stride;
+
+    MBViewState gv = *pv;
+    mb_view_hp_translate_fx(&gv,
+                            fx_mul_d(scale, sx - pv->viewport_width / 2.0),
+                            fx_mul_d(scale, pv->viewport_height / 2.0 - sy));
+
+    char nx[MB_HP_COORD_STR_LEN], ny[MB_HP_COORD_STR_LEN];
+    uint32_t period = 0;
+    uint32_t maxp = max_iter * 2 < 250000u ? max_iter * 2 : 250000u;
+    if (guess_count >= maxp) {
+        // The guess's dip lies beyond the period-scan budget: the Newton
+        // orbit cannot even reach it. Don't burn an MPFR orbit to fail.
+        d->retarget_cooldown = 2;
+        STEER_LOG("[steer] NEWTON-SKIP guess_count=%u maxp=%u\n",
+                  guess_count, maxp);
+        return false;
+    }
+    if (!mb_nucleus_find(gv.center_x_str, gv.center_y_str,
+                         mb_view_zoom_log10(pv),
+                         d->retarget_min_period, maxp, nx, ny, &period) ||
+        period < 8) {
+        d->retarget_cooldown = 4;
+        STEER_LOG("[steer] NEWTON-FAIL guess_cell=%u floor=%u maxp=%u\n",
+                  best_any, d->retarget_min_period, maxp);
+        return false;
+    }
+
+    MBViewState tv = *pv;
+    if (mb_view_hp_set_center(&tv, nx, ny) != 0) {
+        d->retarget_cooldown = 4;
+        return false;
+    }
+    FloatExp dRe, dIm;
+    mb_view_hp_center_delta_fx(pv, &tv, &dRe, &dIm);
+    double px = fx_to_d(fx_div(dRe, scale));
+    double py_up = fx_to_d(fx_div(dIm, scale));
+    double dist = hypot(px, py_up);
+    // Reject relocking where we already are — and jump the floor past
+    // this nucleus's HARMONICS too (its dips repeat at every multiple of
+    // the period; climbing them one rung at a time never escapes).
+    if (dist < span / 64.0) {
+        uint32_t floor2 = period * 2 + 1;
+        if (floor2 > d->retarget_min_period) d->retarget_min_period = floor2;
+        d->retarget_cooldown = 4;
+        STEER_LOG("[steer] RELOCK-SAME rejected, min_period=%u\n",
+                  d->retarget_min_period);
+        return false;
+    }
+    // Beyond the convergent flight envelope even with catch-up moves
+    // (0.85*span, see the FLY branch): fixed point at 1.7*span, keep
+    // margin. In practice this only rejects locks outside the frame.
+    if (dist > 1.3 * span) {
+        d->retarget_cooldown = 4;
+        STEER_LOG("[steer] LOCK-TOO-FAR period=%u dist=%.0fpx\n", period, dist);
+        return false;
+    }
+
+    memcpy(d->target_x, nx, MB_HP_COORD_STR_LEN);
+    memcpy(d->target_y, ny, MB_HP_COORD_STR_LEN);
+    memcpy(d->anchor_x, nx, MB_HP_COORD_STR_LEN);
+    memcpy(d->anchor_y, ny, MB_HP_COORD_STR_LEN);
+    d->anchor_valid = true;
+    d->target_valid = true;
+    d->target_period = period;
+    STEER_LOG("[steer] LOCK period=%u dist=%.0fpx\n", period, dist);
+
+    double f = dist > reach ? reach / dist : 1.0;
+    *out_mx = px * f;
+    *out_my = py_up * f;
+    return true;
+}
+
+// Keep the dive framed on the SET BOUNDARY by an explicit window search,
+// not by reactive nudging. Each keyframe the zoom doubles, so the next
+// probe sees the half-size window around whatever center we choose now.
+// Candidate centers span ±STEER_REACH_FRACTION*span; each candidate's
+// half-size window is scored directly from the current probe grid (the
+// probe square covers the frame, so extended windows lose at most a few
+// edge cells). Pick the best-scoring window:
 //
 //   - a window is scored by its COUNT CONTRAST: the log2 spread between
 //     the 10th and 90th percentile of its cells' iteration counts, with
@@ -169,10 +465,11 @@ void mb_director_start(MBDirector *d, const MBViewState *seed) {
 //     window >90% capped has p90 == p10 == cap and scores zero, so the
 //     framing self-regulates to a mixed, visually rich composition.
 //
-// Induction: the seed frame contains the whole set; if the current frame
-// contains boundary structure, some feasible window contains it (the
-// feasible windows tile the entire frame), so the chosen frame does too —
-// the dive can never end up in a featureless region.
+// Tracking guarantee: a feature at screen offset p moves to 2(p - move) by
+// the next keyframe, so the convergent region is |p| < 2*move_max. With
+// reach 0.42*span in both axes, 2*move_max exceeds the frame half-extents:
+// anything visible in the frame can be re-centered, and since the seed
+// frame contains the whole set, the dive never ends up featureless.
 //
 // "Interior" here means "did not escape within the budget", which includes
 // deep-boundary points — equally good steering targets.
@@ -195,13 +492,18 @@ static void steer_path(MBDirector *d, int keyframe_index) {
     if (stride < 1) return;
 
     // ADAPTIVE iteration budget. The formula budget grows linearly with
-    // depth, but true counts near minibrot cascades grow much faster: the
-    // whole probe caps out, the steering goes blind, and a blind autopilot
-    // tunnels through the structure into flat exterior. When the escaping
-    // counts press against the budget, double it and re-probe (same view +
-    // generation, so orbit continuation makes the deeper pass incremental).
-    // Real interior never uncaps at ANY budget — "counts press against the
-    // ceiling" is what distinguishes a too-small budget from actual set.
+    // depth, but true counts near minibrot cascades grow much faster. The
+    // steering must KEEP ITS TARGET RESOLVED: while a soft (budget-capped
+    // pseudo-interior) blob covers the frame, the true deep core inside it
+    // is invisible and drifts out of frame unseen — every historical dive
+    // escape traces back to a budget step revealing that drift too late.
+    // So keep the soft mass small: whenever more than ~10% of the probe
+    // caps out with counts pressing the budget, double the budget and
+    // re-probe (same view + generation, so orbit continuation makes the
+    // deeper pass incremental). REAL interior never uncaps at any budget;
+    // if a doubling fails to collapse the capped mass by ~30%, that mass
+    // is real set — remember it (real_frac) and stop testing until the
+    // capped fraction grows past it again.
     uint32_t floor_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&probe_view));
     uint32_t max_iter = floor_iter > d->iter_budget ? floor_iter : d->iter_budget;
     max_iter = (max_iter + 2047u) & ~2047u;
@@ -209,8 +511,8 @@ static void steer_path(MBDirector *d, int keyframe_index) {
     int px0 = (d->width - probe_size) / 2;
     int py0 = (d->height - probe_size) / 2;
 
-    int escaped = 0;
-    uint32_t vmax = 0;
+    const int total = PROBE_GRID * PROBE_GRID;
+    double capped_frac = 0.0;
     for (;;) {
         if (mb_deep_renderer_probe_strided(d->renderer, &probe_view,
                                            (uint64_t)keyframe_index * 2,
@@ -218,21 +520,53 @@ static void steer_path(MBDirector *d, int keyframe_index) {
                                            max_iter, d->probe_scratch) != MB_DEEP_OK) {
             return;
         }
-        escaped = 0;
-        vmax = 0;
-        for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
+        int esc = 0;
+        uint32_t vm = 0;
+        for (int i = 0; i < total; i++) {
             uint32_t v = d->probe_scratch[i];
             if (v < max_iter) {
-                escaped++;
-                if (v > vmax) vmax = v;
+                esc++;
+                if (v > vm) vm = v;
             }
         }
-        int capped = PROBE_GRID * PROBE_GRID - escaped;
-        bool blindish = capped * 5 > PROBE_GRID * PROBE_GRID * 3;   // >60% capped
-        bool pressing = escaped == 0 || vmax >= max_iter - max_iter / 4;
-        if (!blindish || !pressing || max_iter >= STEER_ITER_CEIL) break;
+        double prev_frac = capped_frac;
+        capped_frac = (double)(total - esc) / total;
+        if (prev_frac > 0.0 && capped_frac > 0.7 * prev_frac) {
+            // The doubling barely collapsed the capped mass: it is REAL set
+            // (or beyond resolution). Remember that, and REVERT the budget:
+            // raising past real interior buys nothing and every rendered
+            // interior pixel would burn the inflated budget. The deeper
+            // probe data is kept — escaped cells got extra resolution free.
+            d->real_frac = capped_frac;
+            max_iter /= 2;
+            break;
+        }
+        bool pressing = esc == 0 || vm >= max_iter - max_iter / 4;
+        // Trigger on ANY soft mass beyond known-real (a few cells): the
+        // deepest spot is the steering target and must stay resolved even
+        // when it is a single probe cell — a soft cell is indistinguishable
+        // from noise and gets chased like dust.
+        if (capped_frac <= d->real_frac + 2.5 / total || !pressing ||
+            max_iter >= STEER_ITER_CEIL) {
+            break;
+        }
         max_iter *= 2;
     }
+
+    // Re-derive stats at the FINAL threshold (the last probe may have run
+    // at a deeper, reverted budget — its data stays valid above max_iter).
+    int escaped = 0;
+    uint32_t vmax = 0;
+    for (int i = 0; i < total; i++) {
+        uint32_t v = d->probe_scratch[i];
+        if (v < max_iter) {
+            escaped++;
+            if (v > vmax) vmax = v;
+        }
+    }
+    capped_frac = (double)(total - escaped) / total;
+    if (capped_frac < d->real_frac) d->real_frac = capped_frac;
+
     // Decay when over-provisioned: capped cells are then REAL interior, and
     // every rendered interior pixel burns the whole budget.
     if (escaped > 0 && vmax < max_iter / 4) {
@@ -241,6 +575,30 @@ static void steer_path(MBDirector *d, int keyframe_index) {
         if (want < max_iter) max_iter = want;
     }
     d->iter_budget = max_iter;
+
+    // Visual render budget: 2x the p95 escaping count (see struct field)
+    if (escaped > 0) {
+        uint32_t esc_sorted[PROBE_GRID * PROBE_GRID];
+        int m = 0;
+        for (int i = 0; i < total; i++) {
+            if (d->probe_scratch[i] < max_iter) esc_sorted[m++] = d->probe_scratch[i];
+        }
+        for (int a = 1; a < m; a++) {   // insertion sort, m <= 1024
+            uint32_t key = esc_sorted[a];
+            int b = a - 1;
+            while (b >= 0 && esc_sorted[b] > key) {
+                esc_sorted[b + 1] = esc_sorted[b];
+                b--;
+            }
+            esc_sorted[b + 1] = key;
+        }
+        uint64_t rb = (uint64_t)esc_sorted[m - 1 - m / 20] * 2u;
+        if (rb < floor_iter) rb = floor_iter;
+        if (rb > max_iter) rb = max_iter;
+        d->render_budget = ((uint32_t)rb + 2047u) & ~2047u;
+    } else {
+        d->render_budget = max_iter;
+    }
 
     const uint32_t *it = d->probe_scratch;
 
@@ -256,30 +614,64 @@ static void steer_path(MBDirector *d, int keyframe_index) {
         mx = -d->last_move_x / mag * cap;
         my = -d->last_move_y / mag * cap;
     } else {
+        // Deep enough, prefer a nucleus lock: geometric flight to a fixed
+        // coordinate. When locks are unaffordable (embedded periods beyond
+        // the Newton budget), descend onto the last locked minibrot's
+        // boundary instead. Window steering handles shallow zoom and the
+        // pre-first-lock phase.
+        if (mb_view_zoom_log10(&probe_view) >= STEER_NUCLEUS_MIN_LOG10 &&
+            (steer_nucleus(d, &probe_view, it, max_iter, capped_frac,
+                           px0, py0, stride, span,
+                           STEER_REACH_FRACTION * span, &mx, &my) ||
+             steer_boundary_orbit(d, &probe_view, capped_frac, span,
+                                  STEER_REACH_FRACTION * span, &mx, &my))) {
+            goto move_chosen;
+        }
         // Score every feasible next-window placement. Screen coords (y
         // down) throughout; flipped once at the end for the translate.
         // Per-cell log2 counts computed once; capped cells score as
         // extra-deep so real set presence reads as maximum depth.
+        // Cell WEIGHTS are counts relative to the frame maximum: only
+        // cells within a couple of doublings of the deepest matter, but
+        // they ALL contribute — sharp enough to track a narrow nucleus
+        // ridge (a region mean dilutes it), robust enough not to chase a
+        // single noisy cell around a filament tangle (an argmax does).
         double cell_log[PROBE_GRID * PROBE_GRID];
+        double cell_w[PROBE_GRID * PROBE_GRID];
         double cap_log = log2((double)max_iter * 4.0);
+        double lmax = 0.0;
         for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
             uint32_t v = it[i];
             cell_log[i] = v >= max_iter ? cap_log : log2((double)v + 1.0);
+            if (cell_log[i] > lmax) lmax = cell_log[i];
+        }
+        // When the set dominates the frame, capped cells must not act as
+        // the depth attractor — a centroid over a dominant blob sits at
+        // its CORE, and the dive sinks into featureless black interior.
+        // Down-weight them so the deepest ESCAPING structure (the blob's
+        // boundary ring) pulls the window instead.
+        double cap_w = capped_frac > 0.35 ? 0.2 : 1.0;
+        for (int i = 0; i < PROBE_GRID * PROBE_GRID; i++) {
+            cell_w[i] = it[i] >= max_iter ? cap_w
+                                          : exp2(cell_log[i] - lmax);
         }
 
-        double max_ox = d->width / 4.0, max_oy = d->height / 4.0;
-        double max_dist = hypot(max_ox, max_oy);
+        double reach = STEER_REACH_FRACTION * span;
+        double knee = STEER_KNEE_FRACTION * span;
+        double max_dist = hypot(reach, reach);
+        double last_mag = hypot(d->last_move_x, d->last_move_y);
         double best_score = -1e30, best_ox = 0.0, best_oy = 0.0;
 
         for (int cy = 0; cy < STEER_CANDIDATES; cy++) {
             for (int cx = 0; cx < STEER_CANDIDATES; cx++) {
-                double ox = (cx / (STEER_CANDIDATES - 1.0) * 2.0 - 1.0) * max_ox;
-                double oy = (cy / (STEER_CANDIDATES - 1.0) * 2.0 - 1.0) * max_oy;
+                double ox = (cx / (STEER_CANDIDATES - 1.0) * 2.0 - 1.0) * reach;
+                double oy = (cy / (STEER_CANDIDATES - 1.0) * 2.0 - 1.0) * reach;
                 double wcx = d->width / 2.0 + ox;
                 double wcy = d->height / 2.0 + oy;
 
                 double vals[PROBE_GRID * PROBE_GRID];
                 int n = 0, n_int = 0;
+                double sw = 0.0, swl = 0.0, swx = 0.0, swy = 0.0;
                 for (int gy = 0; gy < PROBE_GRID; gy++) {
                     double sy = py0 + (gy + 0.5) * stride;
                     if (fabs(sy - wcy) > d->height / 4.0) continue;
@@ -289,9 +681,13 @@ static void steer_path(MBDirector *d, int keyframe_index) {
                         int i = gy * PROBE_GRID + gx;
                         vals[n++] = cell_log[i];
                         if (it[i] >= max_iter) n_int++;
+                        sw += cell_w[i];
+                        swl += cell_w[i] * cell_log[i];
+                        swx += cell_w[i] * (sx - wcx);
+                        swy += cell_w[i] * (sy - wcy);
                     }
                 }
-                if (n == 0) continue;
+                if (n == 0 || sw <= 0.0) continue;
 
                 // Insertion sort (n is small)
                 for (int a = 1; a < n; a++) {
@@ -306,21 +702,41 @@ static void steer_path(MBDirector *d, int keyframe_index) {
                 // Contrast (p90 - p10, in doublings of iteration count)
                 // keeps a shallow reference in frame for visual shape.
                 double contrast = vals[n - 1 - n / 10] - vals[n / 10];
-                // DEEP PULL: mean of the top quartile — a REGION attractor
-                // toward the deepest counts. This is the dominant term: it
-                // is continuous (no capped-mass threshold to fall off),
-                // robust to single-cell dust, and always points up the
-                // potential gradient toward the set, so the window tracks
-                // the one thing that persists under zoom.
-                int q = n / 4;
-                if (q < 1) q = 1;
-                double deep = 0.0;
-                for (int a = n - q; a < n; a++) deep += vals[a];
-                deep /= q;
+                // DEEP PULL: count-weighted mean log depth, discounted by
+                // how far the weighted centroid sits from the window
+                // center. The only feature that persists under indefinite
+                // zoom is a boundary point; its neighborhood is the
+                // near-maximal count mass, and the budget policy above
+                // keeps that mass resolved.
+                double half_w = d->width / 4.0, half_h = d->height / 4.0;
+                double center_off = hypot((swx / sw) / half_w,
+                                          (swy / sw) / half_h);
+                double deep = swl / sw - 0.5 * center_off;
 
-                double score = deep + contrast
-                             - 1.0 * fabs((double)n_int / n - 0.30)
-                             - 0.30 * hypot(ox, oy) / max_dist;
+                double m = hypot(ox, oy);
+                double pen = 0.30 * (m / max_dist);
+                if (m > knee) pen += 7.0 * (m - knee) / span;
+
+                // Direction hysteresis: competing deep regions on opposite
+                // sides make the argmax flip-flop, wasting the chase budget
+                // on dither. Reward continuing the established course.
+                double hyst = 0.0;
+                if (d->last_move_valid && last_mag > 1.0 && m > 1.0) {
+                    double cosang = (ox * d->last_move_x - oy * d->last_move_y)
+                                    / (m * last_mag);
+                    double s = m / knee;
+                    hyst = 0.25 * cosang * (s < 1.0 ? s : 1.0);
+                }
+
+                double fint = (double)n_int / n;
+                double score = deep + 0.35 * contrast + hyst
+                             - 0.6 * fabs(fint - 0.30)
+                             - pen;
+                // Hard guard: interior-heavy windows are near-black on
+                // screen. The gentle composition bias above cannot stop
+                // the depth attractor from picking them when the deepest
+                // escaping cells sit inside an interior channel.
+                if (fint > 0.55) score -= 4.0 * (fint - 0.55);
 
                 if (score > best_score) {
                     best_score = score;
@@ -332,6 +748,34 @@ static void steer_path(MBDirector *d, int keyframe_index) {
 
         mx = best_ox;
         my = -best_oy;   // screen y-down -> translate y-up
+
+        // PURSUIT: a structure receding at the zoom rate outruns a greedy
+        // centroid chase — the probe only sees the visible TAIL of the
+        // deep field (its core can be a hairline between probe samples),
+        // so the window move systematically under-leads. When this move
+        // agrees with the previous course, lead the target by carrying
+        // the previous move forward; cap at reach. Disengages on course
+        // change or once the target is re-centered (tiny window move).
+        if (d->last_move_valid) {
+            double lm = hypot(d->last_move_x, d->last_move_y);
+            double bm = hypot(mx, my);
+            if (lm > 1.0 && bm > 1.0) {
+                double cosang = (mx * d->last_move_x + my * d->last_move_y)
+                                / (lm * bm);
+                if (cosang > 0.5) {
+                    mx += d->last_move_x * cosang;
+                    my += d->last_move_y * cosang;
+                    // Escaping a dominant blob needs catch-up speed: its
+                    // boundary ring recedes at the zoom rate.
+                    double cap = capped_frac > 0.35 ? 0.6 * span : reach;
+                    double mm = hypot(mx, my);
+                    if (mm > cap) {
+                        mx *= cap / mm;
+                        my *= cap / mm;
+                    }
+                }
+            }
+        }
 
 #ifdef MB_STEER_DEBUG
         {
@@ -358,6 +802,7 @@ static void steer_path(MBDirector *d, int keyframe_index) {
 #endif
     }
 
+move_chosen:
     d->last_move_x = mx;
     d->last_move_y = my;
     d->last_move_valid = true;
@@ -383,6 +828,13 @@ int mb_director_render_next(MBDirector *d) {
 
     pthread_mutex_unlock(&d->lock);
 
+    // Keep the path's OWN zoom current before any HP mutation: digit
+    // preservation in view_hp derives its precision from the view's zoom,
+    // and a path stuck at the seed zoom silently truncates deep-zoom
+    // moves to zero — the camera freezes past ~1e17 while the world zooms
+    // on, which reads as "the dive sailed into a plain area".
+    mb_view_set_zoom_log10(&d->path, k * MB_CINE_STEP);
+
     // Steering happens outside the lock (probes cost real time). The path is
     // worker-owned, so no other thread touches it. Only the entry keyframe
     // renders unsteered, so the movie starts exactly at the user's view.
@@ -394,10 +846,14 @@ int mb_director_render_next(MBDirector *d) {
     mb_view_set_zoom_log10(&view, k * MB_CINE_STEP);
     view.high_precision_mode = mb_view_needs_high_precision(&view);
 
-    // Adaptive budget from the steering probe: without it, regions whose
-    // true counts outrun the formula render as featureless budget-black.
+    // Visual budget from the steering probe: without it, regions whose
+    // true counts outrun the formula render as featureless budget-black;
+    // capped above at the p95-derived render budget so real-interior
+    // pixels don't burn the (much deeper) probe budget every frame.
     uint32_t max_iter = mb_max_iter_for_zoom_log10(mb_view_zoom_log10(&view));
-    if (max_iter < d->iter_budget) max_iter = d->iter_budget;
+    if (d->render_budget && max_iter < d->render_budget) {
+        max_iter = d->render_budget;
+    }
     max_iter = (max_iter + 2047u) & ~2047u;
 
     // Render the frame's tiles CONCURRENTLY (the deep renderer shares one

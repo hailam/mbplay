@@ -45,22 +45,32 @@ kicks in naturally as the dive deepens on a fixed-ish center.
 
 ## Choosing "interesting places" indefinitely
 
-Boundary-following via iteration-count probes:
+Boundary-following via iteration-count probes (final design after several
+live-dive failures; the rationale lives as comments on `steer_path` in
+`director.c`, and `test_cinematic_dive_stays_on_boundary` regression-tests
+it at real viewport size):
 
-- Before scheduling keyframe `k+2`, render a cheap probe of the target
-  neighborhood at depth `2^(k+2)`: the existing
-  `mb_deep_renderer_render_tile_strided` gives a 16×16 sample for ~1/256th
-  of a tile's cost (use raw iteration counts; add an iterations-out variant
-  or a tiny probe entry point).
-- Score pixels: highest *finite* (escaping) iteration count = closest to the
-  boundary = spirals/minibrot cascades; weight toward the current center to
-  avoid jerky retargets. Steer the dive center toward the winner with an
-  eased HP translate (`mb_view_hp_translate_fx`), capped at ~¼ viewport per
-  doubling so adjacent keyframes always overlap for compositing.
-- This self-corrects forever: the boundary is infinitely deep everywhere, so
-  the target never goes interior/exterior-flat. At the 10^4000 ceiling,
-  restart from zoom 1 at a fresh seed (rotate through presets + a hash of
-  the time) — "indefinite" as a loop.
+- Before each keyframe, probe a `PROBE_GRID`² iteration-count grid over the
+  frame (`mb_deep_renderer_probe_strided`; the probe's reference orbit is
+  reused by the tile pass).
+- **Adaptive iteration budget**: a formula linear in depth cannot track real
+  count growth near minibrot cascades. If more than ~10% of the probe caps
+  out while counts press the budget, double it and re-probe (orbit
+  continuation makes this incremental) — a soft budget-capped blob hides
+  its true core, which drifts out of frame unseen. Real set never uncaps:
+  if a doubling doesn't collapse the capped mass, remember that fraction
+  and stop testing. Keyframes render with the same budget.
+- **Window search, not nudging**: candidate next-centers (17×17 grid,
+  reach ±0.42·span in both axes) each define the half-size window the next
+  keyframe will see; score each from the probe and move to the argmax.
+  Score = deep-pull (mean top-quartile log₂ count — a region attractor)
+  + p90−p10 log contrast + composition bias toward ~30% deep coverage
+  + piecewise move penalty (gentle to span/4, steep past it) + direction
+  hysteresis. Kinematics force the reach: a feature at offset p sits at
+  2(p − move) next keyframe, so anything beyond 2·move_max is
+  unrecoverable — reach must cover the frame.
+- At the 10^4000 ceiling, restart from zoom 1 at a fresh preset seed —
+  "indefinite" as a loop.
 
 ## Entry points
 

@@ -138,7 +138,9 @@
 
     _trackingArea = [[NSTrackingArea alloc]
         initWithRect:self.bounds
-             options:(NSTrackingMouseEnteredAndExited | NSTrackingActiveInKeyWindow)
+             options:(NSTrackingMouseEnteredAndExited |
+                      NSTrackingActiveInKeyWindow |
+                      NSTrackingInVisibleRect)
                owner:self
             userInfo:nil];
     [self addTrackingArea:_trackingArea];

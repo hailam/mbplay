@@ -245,6 +245,8 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     BOOL _mouseInView;
     BOOL _showCoordinates;
     NSTrackingArea *_trackingArea;
+    CFAbsoluteTime _cineHudActivity;   // last mouse activity: hover-HUD timer
+    BOOL _cineHudPinned;               // I key pins the cinematic HUD
 
     // Preset menu
     BOOL _showPresetMenu;
@@ -289,7 +291,6 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     double _cineSpeed;               // target speed, decades/second
     double _cineCurSpeed;            // eased actual speed
     CFAbsoluteTime _cineLastTick;
-    int _cineRestartPreset;          // preset rotation for ceiling restarts
 }
 
 - (void)enterCinematic;
@@ -452,8 +453,9 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
         _cineQueue = dispatch_queue_create("com.mandelbrot.cinematic", DISPATCH_QUEUE_SERIAL);
         // Slow-motion default: reads like screen-recording B-roll, and the
         // prefetch pipeline stays far ahead at this pace.
-        _cineSpeed = 0.3;   // decades per second
-        _cineRestartPreset = 0;
+        _cineSpeed = 0.12;  // decades per second: one doubling every
+                            // ~2.5s — Apple-screensaver slow by default
+                            // (override with --speed)
 
         // Load render settings from user defaults or use defaults
         [self loadRenderSettings];
@@ -1264,11 +1266,20 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
     NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
     loc.y = self.bounds.size.height - loc.y;  // Flip Y
     _mousePosition = loc;
+    _cineHudActivity = CFAbsoluteTimeGetCurrent();
     _needsRedraw = YES;
 }
 
 - (void)mouseEntered:(NSEvent *)event {
     _mouseInView = YES;
+    _cineHudActivity = CFAbsoluteTimeGetCurrent();
+    // Re-grab keyboard focus when the cursor returns to the fractal view:
+    // clicking panel controls moves first responder there and keyboard
+    // shortcuts silently die. Don't steal from an active text editor.
+    NSResponder *fr = self.window.firstResponder;
+    if (fr != self && ![fr isKindOfClass:[NSTextView class]]) {
+        [self.window makeFirstResponder:self];
+    }
     _needsRedraw = YES;
 }
 
@@ -1633,6 +1644,7 @@ static const int kPresetCount = sizeof(kPresetLocations) / sizeof(kPresetLocatio
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
+    if (atomic_load(&_cinematicMode)) return;   // autopilot owns the camera
     // Right-click to zoom out
     NSPoint loc = [self convertPoint:event.locationInWindow fromView:nil];
     loc.y = self.bounds.size.height - loc.y;
@@ -1832,7 +1844,9 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
         if (key == 'v' || key == 'V' || key == 27) {
             [self exitCinematic];
         } else if (key == 'i' || key == 'I') {
-            _showHUD = !_showHUD;
+            // Cinematic has its own HUD pin: the interactive _showHUD
+            // defaults ON, and reusing it would defeat hover auto-hide.
+            _cineHudPinned = !_cineHudPinned;
         }
         return;
     }
@@ -2699,7 +2713,13 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
         if (!_cineDirector) return;
     }
 
-    mb_director_start(_cineDirector, &_viewState);
+    // From a (near-)default view, jitter the seed so every dive explores
+    // a fresh path; a deliberately framed deep view is used exactly as-is.
+    MBViewState seed = _viewState;
+    if (mb_view_zoom_log10(&seed) < 1.5) {
+        cine_jitter_seed(&seed, 12.0);
+    }
+    mb_director_start(_cineDirector, &seed);
     _cineZ = mb_view_zoom_log10(&_viewState);
     _cineCurSpeed = 0.0;
     _cineLastTick = CFAbsoluteTimeGetCurrent();
@@ -2803,14 +2823,26 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     }
 }
 
+// Random pixel-scale jitter: the steering is chaotic in the dynamical
+// sense, so a few pixels at the seed diverge into a completely different
+// descent within ~10 keyframes — endless variety, and the seed invariant
+// (set in frame) is untouched.
+static void cine_jitter_seed(MBViewState *seed, double pixels) {
+    double jx = ((double)arc4random() / UINT32_MAX - 0.5) * 2.0 * pixels;
+    double jy = ((double)arc4random() / UINT32_MAX - 0.5) * 2.0 * pixels;
+    FloatExp scale = mb_view_get_scale_fx(seed);
+    mb_view_hp_translate_fx(seed, fx_mul_d(scale, jx), fx_mul_d(scale, jy));
+}
+
 - (void)cinematicRestartFromPreset {
     MBViewState seed;
     mb_view_state_init(&seed, _viewState.viewport_width, _viewState.viewport_height);
-    const PresetLocation *p = &kPresetLocations[_cineRestartPreset % kPresetCount];
-    _cineRestartPreset++;
+    const PresetLocation *p =
+        &kPresetLocations[arc4random_uniform((uint32_t)kPresetCount)];
     seed.center_x = p->center_x;
     seed.center_y = p->center_y;
     mb_view_hp_sync_from_doubles(&seed);
+    cine_jitter_seed(&seed, 40.0);
     mb_director_start(_cineDirector, &seed);
     _cineZ = 0.0;
     _cineCurSpeed = 0.0;
@@ -2826,12 +2858,18 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
     if (dt > 0.1) dt = 0.1;
 
     // Advance the zoom, easing the speed by pipeline health: never outrun
-    // the rendered keyframes — slow down instead of stuttering. The slow
+    // the rendered keyframes — slow down instead of stuttering. Speed is
+    // PROPORTIONAL to pipeline headroom (full at 4 keyframes ahead, zero
+    // at 1) so playback pre-slows while deep keyframes render, rather
+    // than sprinting into starvation and slamming to a halt. The slow
     // blend makes speed changes read as camera work, not corrections
     // (~1.25s time constant, Apple-style slow-motion ramps).
     double ready = mb_director_ready_log10(_cineDirector);
-    double target = (ready - _cineZ) > MB_CINE_STEP * 1.5 ? _cineSpeed : 0.0;
-    double blend = dt * 0.8;
+    double headroom = (ready - _cineZ - MB_CINE_STEP) / (3.0 * MB_CINE_STEP);
+    if (headroom < 0.0) headroom = 0.0;
+    if (headroom > 1.0) headroom = 1.0;
+    double target = _cineSpeed * headroom;
+    double blend = dt * 0.5;   // ~2s speed-ramp time constant
     if (blend > 1.0) blend = 1.0;
     _cineCurSpeed += (target - _cineCurSpeed) * blend;
     _cineZ += _cineCurSpeed * dt;
@@ -2931,9 +2969,13 @@ static void handlePresetKey(MandelbrotView *self, unichar key) {
 
     mb_director_unlock_frames(_cineDirector);
 
-    // HUD (zoom/precision lines read the view state's zoom mirror)
+    // HUD: hover-transient (auto-hides 2.5s after the mouse goes idle)
+    // or pinned with the I key. Deliberately independent of the
+    // interactive-mode _showHUD, which defaults ON.
     mb_view_set_zoom_log10(&_viewState, _cineZ);
-    if (_showHUD) {
+    BOOL hoverHUD = _mouseInView &&
+        (CFAbsoluteTimeGetCurrent() - _cineHudActivity) < 2.5;
+    if (_cineHudPinned || hoverHUD) {
         [self drawHUDToFramebuffer];
     }
 
@@ -3334,9 +3376,6 @@ int native_viewer_init(const char *title, int width, int height, bool clear_cach
     [g_splitView setHoldingPriority:NSLayoutPriorityDefaultHigh forSubviewAtIndex:0];
     [g_splitView setHoldingPriority:NSLayoutPriorityDefaultLow forSubviewAtIndex:1];
 
-    // Position the divider - start collapsed (hidden)
-    [g_splitView setPosition:0.0 ofDividerAtIndex:0];
-
     // Connect control panel to view
     [g_view setControlPanel:g_controlPanel];
 
@@ -3355,6 +3394,26 @@ int native_viewer_init(const char *title, int width, int height, bool clear_cach
     [g_window orderFrontRegardless];
     [g_window makeFirstResponder:g_view];
     [g_window center];
+
+    // Collapse the control panel AFTER the window's first layout: a
+    // divider position set pre-display gets re-proportioned by the split
+    // view's initial adjustSubviews, leaving an empty strip on the left.
+    [g_splitView layoutSubtreeIfNeeded];
+    [g_splitView setPosition:0.0 ofDividerAtIndex:0];
+
+    if (getenv("MB_UI_DEBUG")) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            fprintf(stderr, "[ui] content=%s split=%s panel=%s view=%s\n",
+                    NSStringFromRect([[g_window contentView] frame]).UTF8String,
+                    NSStringFromRect(g_splitView.frame).UTF8String,
+                    NSStringFromRect(g_controlPanel.frame).UTF8String,
+                    NSStringFromRect(g_view.frame).UTF8String);
+            fprintf(stderr, "[ui] view bounds=%s layer=%s\n",
+                    NSStringFromRect(g_view.bounds).UTF8String,
+                    NSStringFromRect(g_view.layer.frame).UTF8String);
+        });
+    }
 
     [NSApp activateIgnoringOtherApps:YES];
     MB_DEBUG_LOG(@"native_viewer_init: window visible=%d, frame=%@",
